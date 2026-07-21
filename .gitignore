@@ -1,0 +1,6 @@
+build/
+build-x86chk/
+*.so
+__pycache__/
+*.pyc
+onnxruntime_profile__*.json
