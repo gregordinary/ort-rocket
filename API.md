@@ -141,8 +141,8 @@ int4-on-ViT rather than of the path.
 int8 weights, and host-quantized int8 activations from the model's static scales. Attention, the
 projector and the norms stay fp16.
 
-It is faithful, at mAP 0.456 against the fp16 path's 0.458, and ~1.8x the fp16 latency. Mainline
-`rocket` has no on-chip int32 accumulation, so every int8 matmul reads its int32 result back to
+It is faithful, at mAP 0.456 against the fp16 path's 0.458, and ~1.8x the fp16 latency. The stack
+implements no on-chip int32 accumulation, so every int8 matmul reads its int32 result back to
 the host. It is a faithfulness and experimentation mode rather than a speed lever, so leave it off
 for deployment. `ROCKET_ORT_STRICT=1` turns a native-int8 marshaling miss into a hard failure
 rather than a silent fp16 fallback, and prints a self-check summary.

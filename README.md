@@ -144,7 +144,7 @@ format. By default it dequantizes the weights to fp16 and runs the same fp16 dat
 faithful and the fast path on this stack.
 
 A native W8A8 int8 datapath (`ROCKET_ORT_INT8=1`) runs the encoder GEMMs as int8 x int8, and is
-~1.8x slower. Mainline `rocket` has no on-chip int32 accumulation, so every int8 matmul reads its
+~1.8x slower. The stack implements no on-chip int32 accumulation, so every int8 matmul reads its
 int32 result back to the host. It is a faithfulness and experimentation mode rather than a speed
 lever. Detail and the accuracy numbers are in [API.md](API.md#quantized-models).
 

@@ -96,8 +96,8 @@ typedef struct {
 // (symmetric, zero-point 0 -- QDQ weight quant is symmetric), and dynamic per-row int8
 // activation quant per call. Everything else (attention, LN, GELU, bias/residual, projector,
 // feature norm) stays fp16, identical to the fp16 resident path. This mode is slower than fp16
-// on this stack (int8 matmul reads int32 back to the host -- there is no on-chip int32 accum in
-// mainline rocket), so it is a faithfulness/experimentation mode, not the default.
+// on this stack (int8 matmul reads int32 back to the host -- the stack implements no on-chip
+// int32 accum), so it is a faithfulness/experimentation mode, not the default.
 // One int8 projection: weight codes w[out*in] (rocket [out,in]) + per-out-channel scale s[out].
 // For the encoder GEMMs the activation is quantized with the model's STATIC per-tensor scale
 // a_scale + zero-point a_zp (asymmetric, matching the QDQ CPU path -- dynamic per-row quant
