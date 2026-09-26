@@ -9,13 +9,17 @@ ort-rocket offloading the encoder to the NPU -- and grades both graph outputs ag
   * pooler_output     -- exercises the host tail (Gather the cls row -> post_layernorm) composed
     with the NPU encoder, i.e. the full CLIP image-embedding path.
 
-Same-box, same session graph, so the CPU EP is the reference (no cross-arch golden question).
+Same-box, same session graph, so the CPU EP is the reference (no cross-arch golden question). A
+matcher miss runs the encoder on the CPU EP at cosine 1.0, so the gate also asserts the EP executed
+a node (from ONNX Runtime's profile) and that neither output is bit-identical to the CPU EP's.
 
   sudo -E .../python test_clip_ep.py <lib.so> <clip_vision.onnx> <input_nchw.npy>
 """
-import os, sys, gc
+import os, sys
 import numpy as np
 import onnxruntime as ort
+
+from ep_common import EpSession, check_not_identical, check_placement
 
 EMB_COS = 0.9999   # exit gate: output cosine vs the CPU EP
 
@@ -36,19 +40,11 @@ def main():
     in_name = scpu.get_inputs()[0].name
     cpu = scpu.run(outs, {in_name: x})
 
-    ort.register_execution_provider_library("rocket", ep_lib)
-    devs = [d for d in ort.get_ep_devices() if d.ep_name == "rocket"]
-    assert devs, "rocket EP not registered"
-    so = ort.SessionOptions()
-    so.log_severity_level = 2
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    so.add_provider_for_devices([devs[0]], {})
-    sep = ort.InferenceSession(onnx_path, so)
-    ep = sep.run(outs, {in_name: x})
-    del sep; gc.collect()
-    ort.unregister_execution_provider_library("rocket")
+    with EpSession(ep_lib, onnx_path, "rocket", log_level=2) as sep:
+        ep = sep.run(outs, {in_name: x})
 
-    ok = True
+    ok = check_placement(sep.placement)
+    ok = check_not_identical(list(zip(outs, ep, cpu))) and ok
     for name, e, c in zip(outs, ep, cpu):
         cos, rel, mx = cos_rel(e, c)
         good = cos >= EMB_COS

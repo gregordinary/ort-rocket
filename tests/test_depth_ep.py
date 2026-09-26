@@ -13,11 +13,17 @@ Two gates:
     needs the tap tensors promoted to graph outputs, so the run builds a tap-augmented copy of the
     model once and caches it beside the original.
 
+A matcher miss runs the whole model on the CPU EP at cosine 1.0, so both gates also require the EP
+to have executed a node (from ONNX Runtime's profile) and no graded output to be bit-identical to
+the CPU EP's.
+
   sudo -E .../python test_depth_ep.py <lib.so> <depth_anything_v2_small_static.onnx> <input_nchw.npy> [--taps]
 """
 import os, sys, gc, time
 import numpy as np
 import onnxruntime as ort
+
+from ep_common import EpSession, check_not_identical, check_placement
 
 DEPTH_COS = 0.9999   # exit gate: depth-map cosine vs the CPU EP
 TAP_COS = 0.999      # exit gate: per-tap encoder cosine vs the CPU EP
@@ -72,16 +78,6 @@ def build_tap_model(onnx_path, taps):
     return out_path
 
 
-def rocket_session(onnx_path, ep_lib):
-    so = ort.SessionOptions()
-    so.log_severity_level = 1   # INFO -> surface the EP claim line
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    devs = [d for d in ort.get_ep_devices() if d.ep_name == "rocket"]
-    assert devs, "rocket EP not registered"
-    so.add_provider_for_devices([devs[0]], {})
-    return ort.InferenceSession(onnx_path, so)
-
-
 def cos_of(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
@@ -134,13 +130,13 @@ def main():
     cpu, t_cpu, ts_cpu = timed(scpu)
     del scpu; gc.collect()
 
-    ort.register_execution_provider_library("rocket", ep_lib)
-    sep = rocket_session(onnx_path, ep_lib)
-    got, t_ep, ts_ep = timed(sep)                      # Compile already packed the weights
-    del sep; gc.collect()                              # session BEFORE unregister, or teardown segfaults
-    ort.unregister_execution_provider_library("rocket")
+    # INFO log surfaces the EP claim line. EpSession releases the session before unregistering
+    # the library, or teardown segfaults. Its profiler adds a small per-node cost to the EP arm.
+    with EpSession(ep_lib, onnx_path, "rocket", log_level=1) as sep:
+        got, t_ep, ts_ep = timed(sep)                  # Compile already packed the weights
 
-    ok = True
+    ok = check_placement(sep.placement)
+    ok = check_not_identical(list(zip(want, got, cpu))) and ok
     dcos = cos_of(got[0], cpu[0])
     absrel, d1 = depth_metrics(got[0], cpu[0])
     maxabs = float(np.max(np.abs(got[0].astype(np.float64) - cpu[0].astype(np.float64))))

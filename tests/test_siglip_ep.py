@@ -3,13 +3,17 @@
 
 Runs the SigLIP vision encoder twice in one process -- once on the ORT CPU EP, once with ort-rocket
 offloading the encoder to the NPU -- and grades the last_hidden_state agreement. Same-box, same
-session graph, so there is no cross-arch golden question: the CPU EP is the reference.
+session graph, so there is no cross-arch golden question: the CPU EP is the reference. A matcher
+miss runs the encoder on the CPU EP at cosine 1.0, so the gate also asserts the EP executed a node
+(from ONNX Runtime's profile) and that the output is not bit-identical to the CPU EP's.
 
   sudo -E .../python test_siglip_ep.py <lib.so> <siglip_vision.onnx> <input_nchw.npy>
 """
-import os, sys, gc
+import os, sys
 import numpy as np
 import onnxruntime as ort
+
+from ep_common import EpSession, check_not_identical, check_placement
 
 EMB_COS = 0.9999   # exit gate: embedding cosine vs the CPU EP
 
@@ -23,24 +27,17 @@ def main():
     in_name = scpu.get_inputs()[0].name
     cpu = scpu.run(["last_hidden_state"], {in_name: x})[0]
 
-    ort.register_execution_provider_library("rocket", ep_lib)
-    devs = [d for d in ort.get_ep_devices() if d.ep_name == "rocket"]
-    assert devs, "rocket EP not registered"
-    so = ort.SessionOptions()
-    so.log_severity_level = 2
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    so.add_provider_for_devices([devs[0]], {})
-    sep = ort.InferenceSession(onnx_path, so)
-    ep = sep.run(["last_hidden_state"], {in_name: x})[0]
-    del sep; gc.collect()
-    ort.unregister_execution_provider_library("rocket")
+    with EpSession(ep_lib, onnx_path, "rocket", log_level=2) as sep:
+        ep = sep.run(["last_hidden_state"], {in_name: x})[0]
 
     a = ep.astype(np.float64).ravel(); b = cpu.astype(np.float64).ravel()
     cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
     rel = float(np.linalg.norm(a - b) / np.linalg.norm(b))
     print(f"[test] last_hidden_state {ep.shape}: cos(ep,cpu)={cos:.7f} rel_l2={rel:.3e} "
           f"max_abs={np.max(np.abs(a-b)):.3e}")
-    ok = cos >= EMB_COS
+    ok = check_placement(sep.placement)
+    ok = check_not_identical([("last_hidden_state", ep, cpu)]) and ok
+    ok = ok and cos >= EMB_COS
     print("RESULT:", "PASS" if ok else "FAIL", f"(gate cos>={EMB_COS})")
     sys.exit(0 if ok else 1)
 

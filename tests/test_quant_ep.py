@@ -10,19 +10,25 @@ quantization band). With ROCKET_ORT_INT8=1 it additionally exercises the native-
 datapath, which must stay faithful (slower is expected -- int8 matmul reads int32 back to the
 host; see rocket_backbone.h).
 
+ROCKET_ORT_STRICT=1 is set unless the caller chose, so an int8 marshaling miss fails Compile
+rather than falling back to fp16 and passing as the int8 datapath. A matcher miss runs the model
+on the CPU EP and matches the reference exactly, so the test also asserts the EP executed a node
+and that neither output is bit-identical to the CPU EP's. A CPU run with no detection fails.
+
 Run with sudo -E (NPU privilege + ROCKET_* env):
   sudo -E .../python test_quant_ep.py <lib.so> <quant.onnx> <input_nchw.npy> [--int8]
 """
 import argparse
-import gc
 import os
 
 import numpy as np
 import onnxruntime as ort
 
+from ep_common import EpSession, check_not_identical, check_placement
+
 REG_NAME = "rocket"
 SCORE_TOL = 0.06   # quantization band (int8/int4 shift scores a few %; classes must still match)
-BOX_TOL = 0.05
+BOX_TOL = 0.05     # the same band on a matched box's normalized cxcywh, largest coordinate
 DET_THRESH = 0.5
 
 
@@ -40,20 +46,10 @@ def decode(dets, labels, thr=DET_THRESH):
 
 
 def run_ep(onnx_path, x):
-    ort.register_execution_provider_library(REG_NAME, os.path.abspath(EP_LIB))
-    devs = [d for d in ort.get_ep_devices() if d.ep_name == REG_NAME]
-    assert devs, f"EP '{REG_NAME}' not registered"
-    so = ort.SessionOptions()
-    so.log_severity_level = 1
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    so.add_provider_for_devices([devs[0]], {})
-    sep = ort.InferenceSession(onnx_path, so)
-    names = [o.name for o in sep.get_outputs()]
-    out = dict(zip(names, sep.run(None, {sep.get_inputs()[0].name: x})))
-    del sep
-    gc.collect()
-    ort.unregister_execution_provider_library(REG_NAME)
-    return out
+    """The EP's outputs, and the placement ONNX Runtime's profile recorded."""
+    with EpSession(EP_LIB, onnx_path, REG_NAME, log_level=1) as sep:
+        out = dict(zip(sep.output_names(), sep.run(None, {sep.input_name(): x})))
+    return out, sep.placement
 
 
 def main():
@@ -68,6 +64,9 @@ def main():
     print(f"[test] quantized model {os.path.basename(args.onnx)}  input {x.shape}  mode={mode}")
     if args.int8:
         os.environ["ROCKET_ORT_INT8"] = "1"
+    # Read at Compile. Without it a native-int8 marshaling miss falls back to fp16 and the run
+    # passes as the int8 datapath it never took.
+    os.environ.setdefault("ROCKET_ORT_STRICT", "1")
 
     # CPU-EP reference on the SAME quantized model.
     scpu = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
@@ -75,10 +74,17 @@ def main():
                     scpu.run(None, {scpu.get_inputs()[0].name: x})))
     cpu_det = decode(ocpu["dets"][0], ocpu["labels"][0])
 
-    oep = run_ep(args.onnx, x)
+    oep, placement = run_ep(args.onnx, x)
     ep_det = decode(oep["dets"][0], oep["labels"][0])
 
+    # Did the EP take the model, and did the NPU compute? A matcher miss passes the match below.
+    ok_ran = check_placement(placement)
+    ok_ran = check_not_identical([(n, oep[n], ocpu[n]) for n in ("dets", "labels")]) and ok_ran
+
     print(f"[test] detections: CPU={len(cpu_det)} EP={len(ep_det)} (thr={DET_THRESH})")
+    if not cpu_det:
+        print("[test] the CPU run has no detection at this threshold, so nothing is compared: "
+              "use an input with objects in it")
     # Match by class + best box IoU rather than query index: heavy quantization (esp. int4) can
     # reshuffle which query fires for an object, so the faithful check is that every CPU
     # detection has a same-class EP detection over the same box.
@@ -98,13 +104,25 @@ def main():
             ok = False
             continue
         ds = abs(best[1]["score"] - g["score"])
-        good = ds <= SCORE_TOL
+        db = max(abs(a - b) for a, b in zip(best[1]["box"], g["box"]))
+        good = ds <= SCORE_TOL and db <= BOX_TOL
         ok = ok and good
         print(f"  cls{g['class_id']} score {g['score']:.3f}/{best[1]['score']:.3f} "
-              f"IoU {best[0]:.3f} dscore {ds:.2e} {'OK' if good else 'FAIL'}")
+              f"IoU {best[0]:.3f} dscore {ds:.2e} dbox {db:.2e} {'OK' if good else 'FAIL'}")
 
-    print("\nRESULT:", "PASS" if ok else "FAIL")
-    raise SystemExit(0 if ok else 1)
+    # EP detections no CPU detection accounts for. Reported, not graded: the CPU EP runs the
+    # QDQ activations in int8 where the EP runs them in fp16, so a query near the threshold can
+    # cross it on one side only.
+    def matched(e):
+        return any(g["class_id"] == e["class_id"] and iou(g["box"], e["box"]) >= 0.5 for g in cpu_det)
+    extra = [e for e in ep_det if not matched(e)]
+    if extra:
+        print(f"[warn] {len(extra)} EP detection(s) with no CPU counterpart: "
+              + ", ".join(f"q{e['query']}/c{e['class_id']}/{e['score']:.3f}" for e in extra[:6]))
+
+    passed = ok and ok_ran and bool(cpu_det)
+    print("\nRESULT:", "PASS" if passed else "FAIL")
+    raise SystemExit(0 if passed else 1)
 
 
 if __name__ == "__main__":

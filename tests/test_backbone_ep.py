@@ -13,6 +13,10 @@ Proves, on device, that:
 Compares the ort-rocket decode against the CPU-EP decode in one process, so there is no
 cross-arch golden-manifest question -- the CPU EP on this box is the reference.
 
+A matcher miss runs the whole model on the CPU EP and matches the reference exactly, so the test
+also asserts the EP executed a node (from ONNX Runtime's profile) and that no output is
+bit-identical to the CPU EP's. It fails a CPU run with no detection, which has nothing to compare.
+
 Run with sudo -E (NPU privilege + ROCKET_* env):
   sudo -E .../python test_backbone_ep.py <lib.so> <rfdetr-nano.onnx> <input_nchw.npy>
 """
@@ -21,6 +25,8 @@ import sys
 
 import numpy as np
 import onnxruntime as ort
+
+from ep_common import EpSession, check_not_identical, check_placement
 
 REG_NAME = "rocket"
 SCORE_TOL = 1e-2
@@ -54,25 +60,12 @@ def main():
     ocpu = dict(zip(names, scpu.run(None, {in_name: x})))
     cpu_det = decode(ocpu["dets"][0], ocpu["labels"][0])
 
-    # ort-rocket EP: backbone+projector on the NPU. Verbose log so claim/compile lines show.
-    ort.register_execution_provider_library(REG_NAME, ep_lib)
-    devs = [d for d in ort.get_ep_devices() if d.ep_name == REG_NAME]
-    assert devs, f"EP '{REG_NAME}' not registered as a device"
-    so = ort.SessionOptions()
-    so.log_severity_level = 1  # INFO: surface the EP's claim/compile lines
-    # The ancestor-set claim and the name-based weight marshaling both rely on the raw
-    # exported graph; ORT's Gemm/SkipLayerNorm/Gelu rewrites otherwise rename the interior.
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    so.add_provider_for_devices([devs[0]], {})
+    # ort-rocket EP: backbone+projector on the NPU. INFO log so claim/compile lines show. The
+    # session is released before the library is unregistered (EpSession.close).
     print("[test] creating session WITH ort-rocket (backbone+projector -> NPU)...")
-    sep = ort.InferenceSession(onnx_path, so)
-    oep = dict(zip(names, sep.run(None, {in_name: x})))
-    # Destroy the session (releases the EP: ReleaseNodeComputeInfos -> rocket_close, ReleaseEp)
-    # BEFORE unregistering the library, or teardown touches freed factory state.
-    del sep
-    import gc
-    gc.collect()
-    ort.unregister_execution_provider_library(REG_NAME)
+    with EpSession(ep_lib, onnx_path, REG_NAME, log_level=1) as sep:
+        oep = dict(zip(names, sep.run(None, {in_name: x})))
+    placement = sep.placement
     ep_det = decode(oep["dets"][0], oep["labels"][0])
 
     # Raw-output faithfulness.
@@ -83,8 +76,16 @@ def main():
         maxabs = float(np.max(np.abs(a - b)))
         print(f"    {n}{oep[n].shape}: cos={cos:.6f} max_abs={maxabs:.3e}")
 
+    # Did the EP take the model, and did the NPU compute? A matcher miss passes every check below.
+    print()
+    ok_ran = check_placement(placement)
+    ok_ran = check_not_identical([(n, oep[n], ocpu[n]) for n in names]) and ok_ran
+
     # Detection agreement (query-by-query on the CPU set).
     print(f"\n[test] detections: CPU={len(cpu_det)} EP={len(ep_det)} (thr={DET_THRESH})")
+    if not cpu_det:
+        print("[test] the CPU run has no detection at this threshold, so nothing is compared: "
+              "use an input with objects in it")
     print(f"{'query':>5} {'cls(cpu/ep)':>12} {'score(cpu/ep)':>16} {'dscore':>9} {'dbox':>9} ok")
     ep_by_q = {d["query"]: d for d in ep_det}
     ok = True
@@ -105,8 +106,9 @@ def main():
         print(f"[warn] {len(extra)} EP detection(s) not in CPU set: "
               + ", ".join(f"q{d['query']}/c{d['class_id']}/{d['score']:.3f}" for d in extra[:6]))
 
-    print("\nRESULT:", "PASS" if ok and not extra else "FAIL")
-    sys.exit(0 if ok and not extra else 1)
+    passed = ok and not extra and ok_ran and bool(cpu_det)
+    print("\nRESULT:", "PASS" if passed else "FAIL")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
