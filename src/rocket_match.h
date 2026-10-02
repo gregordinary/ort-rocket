@@ -68,7 +68,53 @@ struct MatchedLayer {
 // The backbone family a matcher recognizes. MatchAny tries the registered matchers in order and
 // tags the winning match with its family, so Compile can select the right marshaling path. Extend
 // this as new families land (SAM, ...).
-enum class Family { None, DinoV2RfDetr, SiglipVit, SamVitDet, DepthAnythingDpt };
+enum class Family { None, DinoV2RfDetr, SiglipVit, SamVitDet, DepthAnythingDpt, ModernBert };
+
+// A projection weight as the graph carries it: `init` is the initializer (or its QDQ source) that
+// holds it. `rows_of` < 0: the MatMul's weight edge IS the tensor, ONNX [in, out], transpose it.
+// `rows_of` >= 0: the edge is Transpose(Split(init)[rows_of]) of a torch [n*out, in] init split
+// along rows into `nsplit` blocks, so the block is already [out, in].
+struct ProjWeight {
+  std::string tensor;   // the resolvable weight tensor (initializer or DequantizeLinear output)
+  int rows_of = -1, nsplit = 0;
+  std::string bias;     // the bias edge of a following Add (initializer, or a Split output); "" if none
+  int bias_rows_of = -1;
+};
+
+// One ModernBERT encoder layer (Family::ModernBert).
+struct MbLayer {
+  const OrtNode* attn_norm = nullptr;  // LayerNormalization (no bias), null for an identity norm
+  const OrtNode* mlp_norm = nullptr;
+  const OrtNode* wqkv = nullptr;       // MatMul [d, 3d]
+  const OrtNode* wo = nullptr;         // MatMul [d, d]
+  const OrtNode* wi = nullptr;         // MatMul [d, 2 d_ff] -> Split -> GELU(first) * second
+  const OrtNode* wo_mlp = nullptr;     // MatMul [d_ff, d]
+  std::string inv_freq;                // the RoPE inverse-frequency initializer this layer reads
+  std::string scale;                   // the attention-scale constant (dh^-1/4 on q and on k)
+  std::string window;                  // sliding: the LessOrEqual(|i-j|, w) constant; "" for global
+};
+
+// One torch nn.TransformerEncoderLayer(norm_first) after the encoder.
+struct MbPost {
+  const OrtNode* ln1 = nullptr;
+  const OrtNode* ln2 = nullptr;
+  ProjWeight q, k, v, o, w1, w2;
+  std::string scale;
+  bool gelu = false;                   // erf GELU between w1 and w2; false: ReLU
+};
+
+// The ModernBERT match: the stem, the layers, and an optional post stack reading
+// final_norm + Gather(type table, type input).
+struct ModernBertMatch {
+  const OrtNode* tok_gather = nullptr;   // Gather(table [V, d], ids input)
+  const OrtNode* emb_norm = nullptr;
+  const OrtNode* final_norm = nullptr;
+  std::vector<MbLayer> layers;
+  const OrtNode* type_gather = nullptr;  // Gather(table [n, d], type input), or null
+  std::vector<MbPost> post;
+  std::string ids_input, type_input;     // graph input names
+  std::vector<std::string> mask_inputs;  // the other graph inputs the claim reads (the attention mask)
+};
 
 // The whole structural match. `ok` is false with `reason` set when the graph does not present the
 // expected topology -- GetCapability then claims nothing (full CPU fallback) rather than claiming a
@@ -103,6 +149,8 @@ struct BackboneMatch {
   std::vector<std::string> tap_tensors;   // per tap, the normalizing LayerNorm's output tensor
   std::vector<const OrtNode*> tap_norms;  // per tap, that LayerNormalization node (gamma/beta edges)
   std::vector<int> tap_layers;            // per tap, the encoder layer index it reads (ascending)
+  // ModernBERT text encoder (Family::ModernBert). Empty for every vision family.
+  ModernBertMatch mb;
 };
 
 // The DINOv2 + CSP-projector (RF-DETR) family matcher: run the structural match over `graph` (the
@@ -143,6 +191,19 @@ BackboneMatch MatchSamVitDet(const OrtApi& api, const OrtGraph* graph);
 // exported order is (key, value, query), not (q,k,v). The tap tensors/norms/layers land in
 // .tap_tensors/.tap_norms/.tap_layers and are the claim seeds. Pure graph analysis; prefer MatchAny.
 BackboneMatch MatchDepthAnythingDpt(const OrtApi& api, const OrtGraph* graph);
+
+// The ModernBERT (Family::ModernBert) text-encoder matcher. The stem is a token Gather from a graph
+// input into a bias-less LayerNormalization; each layer is walked along its residual chain (an
+// identity or LayerNorm attention norm, a fused [d,3d] qkv MatMul, a [d,d] output projection, a
+// LayerNorm, a [d,2 d_ff] up-projection Split into GELU(first) * second, a [d_ff,d] down-projection).
+// Per layer a bounded backward walk from the output projection finds the RoPE table the layer reads
+// (Cos <- ... <- MatMul(inverse-frequency initializer, positions)), the attention-scale constant, and
+// whether its mask carries a LessOrEqual(|i-j|, w) band (a sliding layer). After the final norm, an
+// Add of Gather(type table, type input) opens an optional post stack of torch pre-norm layers (the
+// Laya decision head), whose q/k/v weights may be one [3d,d] initializer Split in the graph. The
+// exit is the last post layer's residual (else the final norm or the type Add). Anchored on the
+// encoder side only, so the same walk resolves in the whole model and in the fused subgraph.
+BackboneMatch MatchModernBert(const OrtApi& api, const OrtGraph* graph);
 
 // The matcher registry entry point: try every registered family matcher in order, returning the
 // first that matches (with .family set) or a combined-reason miss (.ok = false) if none do. This is

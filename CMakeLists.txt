@@ -65,7 +65,7 @@ endif()
 
 # The EP is a plugin: ONNX Runtime dlopen()s it and calls in through the OrtApi
 # table passed to CreateEpFactories. It therefore does NOT link libonnxruntime.
-add_library(ort_rocket SHARED src/rocket_ep.cc src/rocket_match.cc src/rocket_backbone.c
+add_library(ort_rocket SHARED src/rocket_ep.cc src/rocket_match.cc src/rocket_convt.cc src/rocket_backbone.c
             src/rocket_projector.c src/rocket_ort_host.c)
 target_include_directories(ort_rocket PRIVATE ${ORT_HEADER_DIR})
 target_link_libraries(ort_rocket PRIVATE rocketnpu::rocketnpu)

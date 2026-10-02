@@ -1019,6 +1019,290 @@ BackboneMatch MatchDepthAnythingDpt(const OrtApi& api, const OrtGraph* graph) {
   return m;
 }
 
+// ---------------------------------------------------------------------------------------------
+// ModernBERT (Family::ModernBert)
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+// The initializer shape behind a weight edge, following a QDQ DequantizeLinear.
+const std::vector<int64_t>* WeightShape(const Ctx& c, const std::string& t) {
+  if (c.is_init(t)) return c.init_shape(t);
+  const OrtNode* p = c.prod(t);
+  if (p && c.op(p) == "DequantizeLinear" && !c.ins(p).empty() && c.is_init(c.ins(p)[0]))
+    return c.init_shape(c.ins(p)[0]);
+  return nullptr;
+}
+
+bool IsGraphInput(const Ctx& c, const std::string& t) {
+  return !t.empty() && !c.prod(t) && !c.is_init(t);
+}
+
+// A MatMul reading activation `t` whose weight is a 2D initializer [a, b] (b < 0: any b).
+const OrtNode* MatMulInit(const Ctx& c, const std::string& t, int64_t a, int64_t b, int64_t* got_b) {
+  for (const OrtNode* n : c.cons(t)) {
+    if (c.op(n) != "MatMul" || c.ins(n).size() != 2 || c.ins(n)[0] != t) continue;
+    const std::vector<int64_t>* s = WeightShape(c, c.ins(n)[1]);
+    if (!s || s->size() != 2 || (*s)[0] != a || (b >= 0 && (*s)[1] != b)) continue;
+    if (got_b) *got_b = (*s)[1];
+    return n;
+  }
+  return nullptr;
+}
+
+// A LayerNormalization reading `t`, with (want_bias) or without a bias input.
+const OrtNode* LnOf(const Ctx& c, const std::string& t, bool want_bias) {
+  for (const OrtNode* n : c.cons(t)) {
+    if (c.op(n) != "LayerNormalization" || c.ins(n).empty() || c.ins(n)[0] != t) continue;
+    const bool has_b = c.ins(n).size() >= 3 && !c.ins(n)[2].empty();
+    if (has_b == want_bias) return n;
+  }
+  return nullptr;
+}
+
+// The residual Add reading `x` whose other operand is a MatMul with a [k, d] weight, optionally
+// behind a bias Add. Sets *mm and *bias_add (null when there is none).
+const OrtNode* ResidualAdd(const Ctx& c, const std::string& x, int64_t k, int64_t d,
+                           const OrtNode** mm, const OrtNode** bias_add) {
+  for (const OrtNode* n : c.cons(x)) {
+    if (c.op(n) != "Add" || c.ins(n).size() != 2) continue;
+    const std::string& other = c.ins(n)[0] == x ? c.ins(n)[1] : c.ins(n)[0];
+    const OrtNode* p = c.prod(other);
+    const OrtNode* ba = nullptr;
+    if (p && c.op(p) == "Add" && c.has_init(p)) { ba = p; p = c.prod(c.act_input(p)); }
+    if (!p || c.op(p) != "MatMul" || c.ins(p).size() != 2) continue;
+    const std::vector<int64_t>* s = WeightShape(c, c.ins(p)[1]);
+    if (!s || s->size() != 2 || (*s)[1] != d || (k >= 0 && (*s)[0] != k)) continue;
+    *mm = p; *bias_add = ba;
+    return n;
+  }
+  return nullptr;
+}
+
+// Bounded backward walk from `from`, never expanding a stop tensor, the stop node, or a Shape
+// (a shape computation may read the residual, and following it would reach earlier layers).
+void WalkBack(const Ctx& c, const std::string& from, const std::unordered_set<std::string>& stop_t,
+              const OrtNode* stop_n, const std::function<void(const OrtNode*)>& visit) {
+  std::vector<std::string> st{from};
+  std::unordered_set<const OrtNode*> seen;
+  int budget = 600;
+  while (!st.empty() && budget-- > 0) {
+    std::string t = st.back(); st.pop_back();
+    if (stop_t.count(t)) continue;
+    const OrtNode* p = c.prod(t);
+    if (!p || p == stop_n || seen.count(p)) continue;
+    seen.insert(p);
+    visit(p);
+    if (c.op(p) == "Shape") continue;
+    for (const std::string& in : c.ins(p))
+      if (!in.empty() && !c.is_init(in)) st.push_back(in);
+  }
+}
+
+// A scalar initializer operand of a node, "" if none.
+std::string ScalarInit(const Ctx& c, const OrtNode* n) {
+  for (const std::string& t : c.ins(n)) {
+    if (!c.is_init(t)) continue;
+    const std::vector<int64_t>* s = c.init_shape(t);
+    size_t e = 1;
+    if (s) for (int64_t v : *s) e *= (size_t)v;
+    if (s && e == 1) return t;
+  }
+  return std::string();
+}
+
+// The attention details of one layer: the RoPE table (via its Cos), the scale, the sliding band.
+bool ResolveAttention(const Ctx& c, const std::string& ctx_in, const std::unordered_set<std::string>& stop,
+                      const OrtNode* stop_n, MbLayer* L, std::string* why) {
+  std::vector<const OrtNode*> coss;
+  WalkBack(c, ctx_in, stop, stop_n, [&](const OrtNode* p) {
+    const std::string& op = c.op(p);
+    if (op == "Cos" && std::find(coss.begin(), coss.end(), p) == coss.end()) coss.push_back(p);
+    else if (op == "LessOrEqual") { std::string w = ScalarInit(c, p); if (!w.empty()) L->window = w; }
+    else if (op == "Mul" && L->scale.empty()) L->scale = ScalarInit(c, p);
+  });
+  if (coss.size() != 1) { *why = "a layer reads " + std::to_string(coss.size()) + " RoPE Cos tables, expected 1"; return false; }
+  // Cos <- (Concat/Transpose) <- MatMul(inverse frequencies [.., half, ..], positions)
+  WalkBack(c, c.ins(coss[0])[0], {}, nullptr, [&](const OrtNode* p) {
+    if (!L->inv_freq.empty() || c.op(p) != "MatMul") return;
+    for (const std::string& t : c.ins(p)) {
+      const std::vector<int64_t>* s = c.is_init(t) ? c.init_shape(t) : nullptr;
+      if (!s) continue;
+      int big = 0;
+      for (int64_t v : *s) big += v > 1;
+      if (big == 1) { L->inv_freq = t; return; }
+    }
+  });
+  if (L->inv_freq.empty()) { *why = "no RoPE inverse-frequency initializer behind the layer's Cos"; return false; }
+  if (L->scale.empty()) { *why = "no attention-scale constant in the layer"; return false; }
+  return true;
+}
+
+// One encoder layer starting at residual `x`. Returns false with *why empty when `x` does not open
+// a layer (the encoder ended), or with *why set on a malformed layer.
+bool WalkMbLayer(const Ctx& c, const std::string& x, int64_t d, MbLayer* L, std::string* xnext,
+                 std::string* why) {
+  std::string h = x;
+  const OrtNode* wqkv = MatMulInit(c, x, d, 3 * d, nullptr);
+  if (!wqkv) {
+    const OrtNode* ln = LnOf(c, x, false);
+    if (!ln) return false;
+    wqkv = MatMulInit(c, c.outs(ln)[0], d, 3 * d, nullptr);
+    if (!wqkv) return false;
+    L->attn_norm = ln; h = c.outs(ln)[0];
+  }
+  L->wqkv = wqkv;
+  const OrtNode* ba = nullptr;
+  const OrtNode* a1 = ResidualAdd(c, x, d, d, &L->wo, &ba);
+  if (!a1 || ba) { *why = "no [d,d] attention output projection into the residual"; return false; }
+  const std::string xm = c.outs(a1)[0];
+  L->mlp_norm = LnOf(c, xm, false);
+  if (!L->mlp_norm) { *why = "no bias-less MLP LayerNorm"; return false; }
+  int64_t n2 = 0;
+  L->wi = MatMulInit(c, c.outs(L->mlp_norm)[0], d, -1, &n2);
+  if (!L->wi || n2 % 2) { *why = "no [d, 2 d_ff] MLP up-projection"; return false; }
+  bool split = false;
+  for (const OrtNode* s : c.cons(c.outs(L->wi)[0])) split |= c.op(s) == "Split" && c.outs(s).size() == 2;
+  if (!split) { *why = "the MLP up-projection is not split into a GeGLU pair"; return false; }
+  const OrtNode* a2 = ResidualAdd(c, xm, n2 / 2, d, &L->wo_mlp, &ba);
+  if (!a2 || ba) { *why = "no [d_ff, d] MLP down-projection into the residual"; return false; }
+  *xnext = c.outs(a2)[0];
+  return ResolveAttention(c, c.act_input(L->wo), {x, h}, wqkv, L, why);
+}
+
+// A torch pre-norm head projection's weight: the MatMul's weight edge, or Transpose(Split(init)).
+bool ResolveProj(const Ctx& c, const OrtNode* mm, ProjWeight* w) {
+  const std::string& t = c.ins(mm)[1];
+  if (WeightShape(c, t)) { w->tensor = t; w->rows_of = -1; }
+  else {
+    const OrtNode* tr = c.prod(t);
+    const OrtNode* sp = tr && c.op(tr) == "Transpose" ? c.prod(c.ins(tr)[0]) : nullptr;
+    if (!sp || c.op(sp) != "Split" || !WeightShape(c, c.ins(sp)[0])) return false;
+    const auto& so = c.outs(sp);
+    auto it = std::find(so.begin(), so.end(), c.ins(tr)[0]);
+    w->tensor = c.ins(sp)[0]; w->rows_of = (int)(it - so.begin()); w->nsplit = (int)so.size();
+  }
+  for (const OrtNode* a : c.cons(c.outs(mm)[0])) {
+    if (c.op(a) != "Add") continue;
+    for (const std::string& b : c.ins(a)) {
+      if (b == c.outs(mm)[0]) continue;
+      if (c.is_init(b)) { w->bias = b; return true; }
+      const OrtNode* sp = c.prod(b);
+      if (sp && c.op(sp) == "Split" && c.is_init(c.ins(sp)[0])) {
+        const auto& so = c.outs(sp);
+        w->bias = c.ins(sp)[0]; w->bias_rows_of = (int)(std::find(so.begin(), so.end(), b) - so.begin());
+        return true;
+      }
+    }
+  }
+  return true;   // no bias
+}
+
+// One torch nn.TransformerEncoderLayer(norm_first) starting at residual `x`.
+bool WalkMbPost(const Ctx& c, const std::string& x, int64_t d, MbPost* P, std::string* xnext) {
+  P->ln1 = LnOf(c, x, true);
+  if (!P->ln1) return false;
+  const std::string h = c.outs(P->ln1)[0];
+  // q/k/v: MatMuls fed by h (possibly through a layout Transpose), weights split from one init
+  std::vector<const OrtNode*> qkv;
+  std::vector<std::string> feeds{h};
+  for (const OrtNode* n : c.cons(h)) if (IsLayout(c.op(n))) feeds.push_back(c.outs(n)[0]);
+  for (const std::string& f : feeds)
+    for (const OrtNode* n : c.cons(f))
+      if (c.op(n) == "MatMul" && c.ins(n).size() == 2 && c.ins(n)[0] == f) qkv.push_back(n);
+  if (qkv.size() != 3) return false;
+  ProjWeight pw[3];
+  for (int i = 0; i < 3; i++) if (!ResolveProj(c, qkv[i], &pw[i]) || pw[i].rows_of < 0) return false;
+  for (int i = 0; i < 3; i++) {
+    if (pw[i].rows_of == 0) P->q = pw[i];
+    else if (pw[i].rows_of == 1) P->k = pw[i];
+    else if (pw[i].rows_of == 2) P->v = pw[i];
+  }
+  if (P->q.tensor.empty() || P->k.tensor.empty() || P->v.tensor.empty()) return false;
+  const OrtNode *omm = nullptr, *oba = nullptr;
+  const OrtNode* a1 = ResidualAdd(c, x, d, d, &omm, &oba);
+  if (!a1 || !ResolveProj(c, omm, &P->o)) return false;
+  const std::string xm = c.outs(a1)[0];
+  P->ln2 = LnOf(c, xm, true);
+  if (!P->ln2) return false;
+  int64_t dff = 0;
+  const OrtNode* w1 = MatMulInit(c, c.outs(P->ln2)[0], d, -1, &dff);
+  if (!w1 || !ResolveProj(c, w1, &P->w1)) return false;
+  const OrtNode *w2 = nullptr, *b2 = nullptr;
+  const OrtNode* a2 = ResidualAdd(c, xm, dff, d, &w2, &b2);
+  if (!a2 || !ResolveProj(c, w2, &P->w2)) return false;
+  // the activation between w1's bias Add and w2: ReLU, or erf GELU
+  bool relu = false, erf = false;
+  WalkBack(c, c.act_input(w2), {c.outs(P->ln2)[0]}, w1, [&](const OrtNode* p) {
+    relu |= c.op(p) == "Relu"; erf |= c.op(p) == "Erf";
+  });
+  if (relu == erf) return false;
+  P->gelu = erf;
+  WalkBack(c, c.act_input(omm), {h, x}, nullptr, [&](const OrtNode* p) {
+    if (c.op(p) == "Mul" && P->scale.empty()) P->scale = ScalarInit(c, p);
+  });
+  *xnext = c.outs(a2)[0];
+  return true;
+}
+
+}  // namespace
+
+BackboneMatch MatchModernBert(const OrtApi& api, const OrtGraph* graph) {
+  BackboneMatch m;
+  Ctx c(api, graph);
+  if (c.err) { m.reason = "graph read failed"; return m; }
+  ModernBertMatch& mb = m.mb;
+  // Stem: Gather(table [V, d], graph input) -> bias-less LayerNormalization.
+  for (const OrtNode* n : c.nodes()) {
+    if (c.op(n) != "Gather" || c.ins(n).size() != 2 || !IsGraphInput(c, c.ins(n)[1])) continue;
+    const std::vector<int64_t>* s = WeightShape(c, c.ins(n)[0]);
+    if (!s || s->size() != 2) continue;
+    const OrtNode* ln = LnOf(c, c.outs(n)[0], false);
+    if (!ln) continue;
+    mb.tok_gather = n; mb.emb_norm = ln; mb.ids_input = c.ins(n)[1];
+    break;
+  }
+  if (!mb.tok_gather) { m.reason = "no token-embedding Gather into a LayerNorm"; return m; }
+  const int64_t d = (*WeightShape(c, c.ins(mb.tok_gather)[0]))[1];
+
+  std::string x = c.outs(mb.emb_norm)[0];
+  for (;;) {
+    MbLayer L;
+    std::string xn, why;
+    if (!WalkMbLayer(c, x, d, &L, &xn, &why)) {
+      if (!why.empty()) { m.reason = "layer " + std::to_string(mb.layers.size()) + ": " + why; return m; }
+      break;
+    }
+    mb.layers.push_back(L);
+    x = xn;
+  }
+  if (mb.layers.size() < 2) { m.reason = "fewer than 2 ModernBERT layers"; return m; }
+  mb.final_norm = LnOf(c, x, false);
+  if (!mb.final_norm) { m.reason = "no final LayerNorm after the last layer"; return m; }
+  x = c.outs(mb.final_norm)[0];
+  // Optional post bias: Add(final, Unsqueeze(Gather(type table, graph input))).
+  for (const OrtNode* a : c.cons(x)) {
+    if (c.op(a) != "Add" || c.ins(a).size() != 2) continue;
+    const OrtNode* p = c.prod(c.ins(a)[0] == x ? c.ins(a)[1] : c.ins(a)[0]);
+    while (p && IsLayout(c.op(p))) p = c.prod(c.ins(p)[0]);
+    if (!p || c.op(p) != "Gather" || c.ins(p).size() != 2 || !IsGraphInput(c, c.ins(p)[1])) continue;
+    const std::vector<int64_t>* s = WeightShape(c, c.ins(p)[0]);
+    if (!s || s->size() != 2 || (*s)[1] != d) continue;
+    mb.type_gather = p; mb.type_input = c.ins(p)[1];
+    x = c.outs(a)[0];
+    break;
+  }
+  for (;;) {
+    MbPost P;
+    std::string xn;
+    if (!WalkMbPost(c, x, d, &P, &xn)) break;
+    mb.post.push_back(P);
+    x = xn;
+  }
+  m.exit_tensor = x;
+  m.ok = true;
+  return m;
+}
+
 BackboneMatch MatchAny(const OrtApi& api, const OrtGraph* graph) {
   struct Entry { Family family; const char* name; BackboneMatch (*fn)(const OrtApi&, const OrtGraph*); };
   // Registered family matchers, tried in order. Adding a target is: register its signature here,
@@ -1037,7 +1321,10 @@ BackboneMatch MatchAny(const OrtApi& api, const OrtGraph* graph) {
   // /head/conv3/Conv_output_0 as a "projector exit", silently swallowing the entire DPT head into a
   // subgraph the DINOv2 marshaler would then compute as something else entirely. Over-claiming in
   // GetCapability corrupts the output with no fallback, so do not rely on that miss for separation.
+  // ModernBERT leads: its stem (a token Gather from a graph input into a bias-less LayerNorm) is
+  // one no vision family has, and every vision matcher needs a patch Conv a text graph lacks.
   static const Entry kRegistry[] = {
+    {Family::ModernBert,       "modernbert",    &MatchModernBert},
     {Family::DepthAnythingDpt, "depth-dpt",     &MatchDepthAnythingDpt},
     {Family::DinoV2RfDetr,     "dinov2-rfdetr", &MatchBackbone},
     {Family::SamVitDet,        "sam-vitdet",    &MatchSamVitDet},

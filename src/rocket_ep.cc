@@ -11,7 +11,9 @@
 // transposed to rocket [out,in]; fp32 -> fp16; LayerScale folded into Wo/bo,Wf2/bf2 where
 // present); Compute runs the encoder on the NPU. Everything a family does not claim -- the
 // deformable decoder and DETR postproc, the pooling heads, the SAM prompt/mask decoder, the
-// DPT depth head -- is not claimed and falls back to ORT's CPU kernels.
+// DPT depth head -- is not claimed and falls back to ORT's CPU kernels. The same GetCapability
+// pass also claims each eligible ConvTranspose outside the family claim, in any graph, as a fused
+// node of its own (rocket_convt, the resident transposed convolution).
 //
 // Each family's compute is graded bit-faithful to the ORT CPU EP off-device before it claims
 // on device. This file is the ORT plumbing: partition, weight marshaling, and kernel-context
@@ -43,7 +45,9 @@
 #include "rocket_projector.h"
 #include "rocket_sam.h"
 #include "rocket_siglip.h"
+#include "rocket_modernbert.h"
 #include "rocket_match.h"
+#include "rocket_convt.h"
 
 namespace {
 
@@ -105,6 +109,21 @@ struct CompiledBackbone {
   // fused node's output names against the matcher's tap tensors (never positional guesswork).
   bool is_depth = false;
   std::vector<size_t> tap_out_slot;
+  // ModernBERT text encoder (Family::ModernBert), with the Laya decision head as its post stack.
+  // The fused node reads token ids, the attention mask and the type ids, not an image; the token
+  // and type tables are copied at Compile so Compute gathers from them directly.
+  bool is_mb = false;
+  rocket_modernbert_model mbm{};
+  rocket_mb_ctx* mbctx = nullptr;
+  std::vector<std::vector<float>> owned_f32;   // RoPE frequencies, the type table
+  const _Float16* mb_tok = nullptr;            // [V][d] token table (in `owned`)
+  int64_t mb_vocab = 0;
+  const float* mb_type = nullptr;              // [n_type][d], or null without a post bias
+  int64_t mb_ntype = 0;
+  static constexpr size_t kNoInput = static_cast<size_t>(-1);
+  size_t mb_ids_idx = kNoInput, mb_mask_idx = kNoInput, mb_type_idx = kNoInput;
+  std::vector<float> s_emb, s_pb, s_mbout;
+  std::vector<int> s_len;
   // The fused node lists every initializer as an input; the image is the one
   // non-initializer input. Its index, found at Compile, is what Compute reads.
   size_t image_in_idx = 0;
@@ -136,6 +155,7 @@ struct CompiledBackbone {
     if (pctx) rocket_projector_ctx_free(pctx);
     if (sctx) rocket_siglip_ctx_free(sctx);
     if (sctx2) rocket_sam_ctx_free(sctx2);
+    if (mbctx) rocket_modernbert_ctx_free(mbctx);
     if (fd >= 0) rocket_close(fd);
   }
 
@@ -161,6 +181,15 @@ struct RocketEp : OrtEp {
   const OrtApi& ort_api;
   std::string name;
   const OrtLogger& logger;
+  // The resident-matmul context every claimed ConvTranspose packs on, opened at the first
+  // GetCapability that finds a claimable one. ct_open_failed stops a retry per graph.
+  std::shared_ptr<rocket_convt::Shared> ct_shared;
+  bool ct_open_failed = false;
+  // The session's session.intra_op.allow_spinning (ONNX Runtime's default is on), read at CreateEp.
+  // Spinning intra-op threads take the cores a claimed ConvTranspose's workers need, so a claim
+  // under it logs one warning.
+  bool intra_spin = true;
+  bool spin_warned = false;
 
   void Log(OrtLoggingLevel lvl, const std::string& msg) const {
     DiscardStatus(ort_api, ort_api.Logger_LogMessage(&logger, lvl, msg.c_str(),
@@ -172,25 +201,44 @@ struct RocketEp : OrtEp {
     return static_cast<const RocketEp*>(p)->name.c_str();
   }
 
-  // Claim the DINOv2 encoder subgraph (the ancestor set of the 4 feature tensors) as one
-  // fused node. Convex by construction; the boundary is the image in and the 4 features out.
+  // Two kinds of claim share one pass. The first family whose signature matches claims its encoder
+  // subgraph as one fused node; then every ConvTranspose outside that subgraph that the resident
+  // entry can run is claimed as a fused node of its own. Either may be empty; neither depends on the
+  // other.
   static OrtStatus* ORT_API_CALL GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
                                                    OrtEpGraphSupportInfo* support_info) noexcept {
     auto* ep = static_cast<RocketEp*>(this_ptr);
+    const OrtApi& api = ep->ort_api;
+    size_t num_nodes = 0;
+    if (OrtStatus* st = api.Graph_GetNumNodes(graph, &num_nodes)) return st;
+    std::vector<const OrtNode*> nodes(num_nodes);
+    if (OrtStatus* st = api.Graph_GetNodes(graph, nodes.data(), num_nodes)) return st;
+    std::vector<char> claimed_flag(num_nodes, 0);
+    if (OrtStatus* st = ClaimFamily(ep, graph, nodes, &claimed_flag, support_info)) return st;
+    return ClaimConvTranspose(ep, nodes, claimed_flag, support_info);
+  }
+
+  // Claim the DINOv2 encoder subgraph (the ancestor set of the 4 feature tensors) as one
+  // fused node. Convex by construction; the boundary is the image in and the 4 features out.
+  // Marks the claimed nodes in *claimed_flag; claims nothing when no family matches.
+  static OrtStatus* ClaimFamily(RocketEp* ep, const OrtGraph* graph,
+                                const std::vector<const OrtNode*>& nodes,
+                                std::vector<char>* claimed_flag_out,
+                                OrtEpGraphSupportInfo* support_info) {
     const OrtApi& api = ep->ort_api;
     const OrtEpApi& ep_api = *api.GetEpApi();
 
     // Structural match: locate the encoder+projector by op topology (no name dependency), trying
     // each registered backbone family in turn (MatchAny). On any miss -- not a recognized graph, or
-    // a graph whose optimizations were left on so the block was fused away -- claim nothing and let
-    // ORT place everything on its CPU kernels.
+    // a graph whose optimizations were left on so the block was fused away -- claim no encoder and
+    // leave it to ORT's CPU kernels.
     rocket_match::BackboneMatch match = rocket_match::MatchAny(api, graph);
     if (!match.ok) {
       ep->Log(ORT_LOGGING_LEVEL_INFO,
-              std::string("ort-rocket: not claiming (") + match.reason +
-                  "); full CPU fallback. This EP offloads the encoder of RF-DETR, CLIP/SigLIP, SAM, and Depth Anything v2; run "
-                  "the session with graph_optimization_level=ORT_DISABLE_ALL so the exported op "
-                  "topology survives.");
+              std::string("ort-rocket: no encoder family matched (") + match.reason +
+                  "). This EP offloads the encoder of RF-DETR, CLIP/SigLIP, SAM, Depth Anything v2 and "
+                  "ModernBERT; run the session with graph_optimization_level=ORT_DISABLE_ALL so the "
+                  "exported op topology survives.");
       return nullptr;
     }
     // Durable: family-specific pre-claim validation, so a partial/unexpected match degrades to
@@ -205,7 +253,7 @@ struct RocketEp : OrtEp {
         ep->Log(ORT_LOGGING_LEVEL_WARNING,
                 "ort-rocket: matched a DINOv2-shaped subgraph (patch " + std::to_string(match.patch_size) +
                     ", " + std::to_string(match.layers.size()) + " encoder layers) that does not fit a "
-                    "known RF-DETR variant; not claiming (full CPU fallback).");
+                    "known RF-DETR variant; not claiming the encoder.");
         return nullptr;
       }
     }
@@ -214,10 +262,7 @@ struct RocketEp : OrtEp {
     const bool is_siglip = match.family == rocket_match::Family::SiglipVit;
     const bool is_sam = match.family == rocket_match::Family::SamVitDet;
 
-    size_t num_nodes = 0;
-    if (OrtStatus* st = api.Graph_GetNumNodes(graph, &num_nodes)) return st;
-    std::vector<const OrtNode*> nodes(num_nodes);
-    if (OrtStatus* st = api.Graph_GetNodes(graph, nodes.data(), num_nodes)) return st;
+    const size_t num_nodes = nodes.size();
 
     // producer[tensor name] -> node index; node_inputs[i] -> its input tensor names.
     std::unordered_map<std::string, size_t> producer;
@@ -250,7 +295,7 @@ struct RocketEp : OrtEp {
     // union of ancestor sets is still ancestor-closed, hence still convex, so the multi-seed claim
     // is as safe a partition as the single-seed one -- it just leaves a fused node with one output
     // per tap instead of one.
-    std::vector<char> claimed_flag(num_nodes, 0);
+    std::vector<char>& claimed_flag = *claimed_flag_out;
     std::vector<std::string> stack;
     std::unordered_map<std::string, char> visited;
     if (!match.tap_tensors.empty())
@@ -275,11 +320,13 @@ struct RocketEp : OrtEp {
       if (claimed_flag[i]) claimed.push_back(nodes[i]);
 
     if (claimed.empty()) {   // exit tensor had no producer in this graph -- should not happen post-match
-      ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: matched but claimed no nodes; full CPU fallback.");
+      ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: matched but claimed no nodes; the encoder stays on the CPU.");
       return nullptr;
     }
     const char* fam_desc =
-        match.family == rocket_match::Family::DepthAnythingDpt
+        match.family == rocket_match::Family::ModernBert
+            ? "ModernBERT text encoder + post stack, exit the last post layer"
+        : match.family == rocket_match::Family::DepthAnythingDpt
             ? "Depth Anything v2 DINOv2 encoder, exit the DPT taps (head stays on host)"
         : is_sam     ? "SAM ViT-Det encoder (windowed + rel-pos), exit neck output"
         : is_siglip  ? "plain-ViT encoder, exit last_hidden_state"
@@ -290,6 +337,82 @@ struct RocketEp : OrtEp {
                 std::to_string(match.layers.size()) + " layers) as one fused node");
     return ep_api.EpGraphSupportInfo_AddNodesToFuse(support_info, claimed.data(),
                                                     claimed.size(), nullptr);
+  }
+
+  // Claim each ConvTranspose the resident entry can run, one fused node per node, outside the family
+  // claim. The refusals are counted by reason and logged as one line, so a model's coverage reads off
+  // the session log.
+  static OrtStatus* ClaimConvTranspose(RocketEp* ep, const std::vector<const OrtNode*>& nodes,
+                                       const std::vector<char>& claimed_flag,
+                                       OrtEpGraphSupportInfo* support_info) {
+    const OrtApi& api = ep->ort_api;
+    const OrtEpApi& ep_api = *api.GetEpApi();
+    std::vector<std::pair<std::string, int>> refused;
+    int claimed = 0, seen = 0;
+    for (size_t i = 0; i < nodes.size(); i++) {
+      if (claimed_flag[i] || NodeOpType(api, nodes[i]) != "ConvTranspose") continue;
+      seen++;
+      std::string why;
+      if (!rocket_convt::Enabled()) {
+        why = "ROCKET_ORT_CONVTRANSPOSE=0";
+      } else {
+        rocket_convt::Spec spec;
+        if (OrtStatus* st = rocket_convt::Check(api, nodes[i], &spec, &why)) return st;
+      }
+      if (why.empty() && !ep->ct_shared) {
+        if (ep->ct_open_failed) {
+          why = "device did not open";
+        } else {
+          int nthreads = 3;
+          if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
+          std::string err;
+          ep->ct_shared = rocket_convt::OpenShared(nthreads, &err);
+          if (!ep->ct_shared) {
+            ep->ct_open_failed = true;
+            ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: " + err + "; ConvTranspose stays on the CPU");
+            why = "device did not open";
+          }
+        }
+      }
+      if (!why.empty()) {
+        bool counted = false;
+        for (auto& r : refused)
+          if (r.first == why) { r.second++; counted = true; break; }
+        if (!counted) refused.emplace_back(why, 1);
+        continue;
+      }
+      OrtNodeFusionOptions opts{};
+      opts.ort_version_supported = ORT_API_VERSION;
+      opts.drop_constant_initializers = true;   // Compile keeps its own copy of the weight
+      if (OrtStatus* st = ep_api.EpGraphSupportInfo_AddNodesToFuse(support_info, &nodes[i], 1, &opts))
+        return st;
+      claimed++;
+    }
+    if (claimed && ep->intra_spin && !ep->spin_warned) {
+      ep->spin_warned = true;
+      ep->Log(ORT_LOGGING_LEVEL_WARNING,
+              "ort-rocket: session.intra_op.allow_spinning is on, so ONNX Runtime's idle intra-op "
+              "threads spin while each claimed ConvTranspose runs and take the cores its NPU workers "
+              "and scatter-add need. Set session.intra_op.allow_spinning=0 for this session.");
+    }
+    if (seen) {
+      std::string msg = "ort-rocket: claiming " + std::to_string(claimed) + " of " + std::to_string(seen) +
+                        " ConvTranspose node(s) outside the encoder claim";
+      if (!refused.empty()) {
+        msg += "; left on the CPU:";
+        for (size_t r = 0; r < refused.size(); r++)
+          msg += (r ? ", " : " ") + std::to_string(refused[r].second) + " " + refused[r].first;
+      }
+      ep->Log(ORT_LOGGING_LEVEL_INFO, msg);
+    }
+    return nullptr;
+  }
+
+  static std::string NodeOpType(const OrtApi& api, const OrtNode* n) {
+    const char* op = nullptr;
+    OrtStatus* st = api.Node_GetOperatorType(n, &op);
+    if (st) { api.ReleaseStatus(st); return std::string(); }
+    return op ? std::string(op) : std::string();
   }
 
   static OrtStatus* ORT_API_CALL CompileImpl(OrtEp* this_ptr, const OrtGraph** graphs,
@@ -800,16 +923,137 @@ static OrtStatus* ComputeSamImpl(CompiledBackbone* st, OrtKernelContext* kctx) {
   return nullptr;
 }
 
+// Read an integer tensor input [n] as int64, from int64 / int32 / bool storage.
+static OrtStatus* ReadIntInput(const OrtApi& api, OrtKernelContext* kctx, size_t idx, const char* what,
+                               std::vector<int64_t>* dims, std::vector<int64_t>* vals) {
+  const OrtValue* v = nullptr;
+  if (OrtStatus* s = api.KernelContext_GetInput(kctx, idx, &v)) return s;
+  OrtTensorTypeAndShapeInfo* info = nullptr;
+  if (OrtStatus* s = api.GetTensorTypeAndShape(v, &info)) return s;
+  ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  size_t n = 0, nd = 0;
+  OrtStatus* s = api.GetTensorElementType(info, &et);
+  if (!s) s = api.GetTensorShapeElementCount(info, &n);
+  if (!s) s = api.GetDimensionsCount(info, &nd);
+  if (!s) { dims->resize(nd); s = api.GetDimensions(info, dims->data(), nd); }
+  api.ReleaseTensorTypeAndShapeInfo(info);
+  if (s) return s;
+  const void* raw = nullptr;
+  if (OrtStatus* s2 = api.GetTensorData(v, &raw)) return s2;
+  vals->resize(n);
+  switch (et) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
+      const int64_t* p = static_cast<const int64_t*>(raw);
+      for (size_t i = 0; i < n; i++) (*vals)[i] = p[i];
+      break;
+    }
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: {
+      const int32_t* p = static_cast<const int32_t*>(raw);
+      for (size_t i = 0; i < n; i++) (*vals)[i] = p[i];
+      break;
+    }
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: {
+      const bool* p = static_cast<const bool*>(raw);
+      for (size_t i = 0; i < n; i++) (*vals)[i] = p[i] ? 1 : 0;
+      break;
+    }
+    default:
+      return api.CreateStatus(ORT_INVALID_ARGUMENT,
+          (std::string("ort-rocket: ") + what + " must be int64, int32 or bool").c_str());
+  }
+  return nullptr;
+}
+
+// ModernBERT Compute: token ids [B,T], the attention mask [B,T] and the type ids [B] in; the
+// exit tensor [B,T,d] out. Each row's mask must be a prefix of ones (right padding, which is how
+// the tokenizer pads); its length is that row's live token count. The caller holds run_mtx.
+static OrtStatus* ComputeModernBertImpl(CompiledBackbone* st, OrtKernelContext* kctx) {
+  const OrtApi& api = st->api;
+  const int d = st->mbm.d;
+  std::vector<int64_t> idims, ids, mdims, mask, tdims, types;
+  if (OrtStatus* s = ReadIntInput(api, kctx, st->mb_ids_idx, "input_ids", &idims, &ids)) return s;
+  if (idims.size() != 2 || idims[0] < 1 || idims[1] < 1)
+    return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: token ids must be [batch, seq_len]");
+  const int B = static_cast<int>(idims[0]), T = static_cast<int>(idims[1]);
+  st->s_len.assign(B, T);
+  if (st->mb_mask_idx != CompiledBackbone::kNoInput) {
+    if (OrtStatus* s = ReadIntInput(api, kctx, st->mb_mask_idx, "attention_mask", &mdims, &mask)) return s;
+    if (mdims != idims)
+      return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: attention_mask shape != input_ids shape");
+    for (int b = 0; b < B; b++) {
+      int L = 0;
+      while (L < T && mask[(size_t)b * T + L]) L++;
+      for (int t = L; t < T; t++)
+        if (mask[(size_t)b * T + t])
+          return api.CreateStatus(ORT_INVALID_ARGUMENT,
+              "ort-rocket: attention_mask is not right-padded (a 1 follows a 0); the NPU encoder "
+              "runs each row at its live length");
+      if (L == 0) return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: a row has no live tokens");
+      st->s_len[b] = L;
+    }
+  }
+  const float* pb = nullptr;
+  if (st->mb_type_idx != CompiledBackbone::kNoInput) {
+    if (OrtStatus* s = ReadIntInput(api, kctx, st->mb_type_idx, "type ids", &tdims, &types)) return s;
+    if (types.size() != static_cast<size_t>(B))
+      return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: type ids must be [batch]");
+    st->s_pb.resize((size_t)B * d);
+    for (int b = 0; b < B; b++) {
+      if (types[b] < 0 || types[b] >= st->mb_ntype)
+        return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: type id out of range");
+      std::memcpy(&st->s_pb[(size_t)b * d], st->mb_type + types[b] * d, (size_t)d * sizeof(float));
+    }
+    pb = st->s_pb.data();
+  }
+  st->s_emb.resize((size_t)B * T * d);
+  for (int b = 0; b < B; b++)
+    for (int t = 0; t < st->s_len[b]; t++) {
+      const int64_t id = ids[(size_t)b * T + t];
+      if (id < 0 || id >= st->mb_vocab)
+        return api.CreateStatus(ORT_INVALID_ARGUMENT, "ort-rocket: token id out of range");
+      const _Float16* row = st->mb_tok + id * d;
+      float* e = &st->s_emb[((size_t)b * T + t) * d];
+      for (int j = 0; j < d; j++) e[j] = static_cast<float>(row[j]);
+    }
+  st->s_mbout.resize((size_t)B * T * d);
+  int rc = rocket_modernbert_encode(st->mbctx, B, T, st->s_len.data(), st->s_emb.data(), pb,
+                                    st->s_mbout.data(), nullptr);
+  if (rc != 0)
+    return api.CreateStatus(ORT_FAIL, ("ort-rocket: ModernBERT encode failed rc=" + std::to_string(rc)).c_str());
+  const int64_t shape[3] = {B, T, d};
+  OrtValue* out = nullptr;
+  if (OrtStatus* s = api.KernelContext_GetOutput(kctx, 0, shape, 3, &out)) return s;
+  void* od = nullptr;
+  if (OrtStatus* s = api.GetTensorMutableData(out, &od)) return s;
+  ONNXTensorElementDataType out_et = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  {
+    OrtTensorTypeAndShapeInfo* oi = nullptr;
+    if (OrtStatus* s = api.GetTensorTypeAndShape(out, &oi)) return s;
+    OrtStatus* s = api.GetTensorElementType(oi, &out_et);
+    api.ReleaseTensorTypeAndShapeInfo(oi);
+    if (s) return s;
+  }
+  const size_t n = (size_t)B * T * d;
+  if (out_et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    _Float16* o = static_cast<_Float16*>(od);
+    for (size_t i = 0; i < n; i++) o[i] = static_cast<_Float16>(st->s_mbout[i]);
+  } else {
+    std::memcpy(od, st->s_mbout.data(), n * sizeof(float));
+  }
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // OrtNodeComputeInfo implementation.
 // ---------------------------------------------------------------------------
-struct BackboneComputeInfo : OrtNodeComputeInfo {
-  explicit BackboneComputeInfo(CompiledBackbone* st) : OrtNodeComputeInfo{}, state(st) {
+struct BackboneComputeInfo : rocket_convt::ComputeInfoBase {
+  explicit BackboneComputeInfo(CompiledBackbone* st) : state(st) {
     ort_version_supported = ORT_API_VERSION;
     CreateState = CreateStateImpl;
     Compute = ComputeImpl;
     ReleaseState = ReleaseStateImpl;
   }
+  ~BackboneComputeInfo() override { delete state; }
   CompiledBackbone* state;
 
   static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr,
@@ -826,6 +1070,7 @@ struct BackboneComputeInfo : OrtNodeComputeInfo {
     // Serialize concurrent Run()s on this session: the state (ctxs, fd, scratch) is shared and
     // not thread-safe. See CompiledBackbone::run_mtx.
     std::lock_guard<std::mutex> run_guard(st->run_mtx);
+    if (st->is_mb) return ComputeModernBertImpl(st, kctx);
     if (st->is_depth) return ComputeDepthImpl(st, kctx);
     if (st->is_siglip) return ComputeSiglipImpl(st, kctx);
     if (st->is_sam) return ComputeSamImpl(st, kctx);
@@ -1996,23 +2241,258 @@ static OrtStatus* MapDepthOutputs(const OrtApi& api, const OrtNode* fused,
   return nullptr;
 }
 
-OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** graphs,
-                                              const OrtNode** fused_nodes, size_t count,
-                                              OrtNodeComputeInfo** node_compute_infos,
-                                              OrtNode** /*ep_context_nodes*/) noexcept {
-  auto* ep = static_cast<RocketEp*>(this_ptr);
+// ---------------------------------------------------------------------------
+// ModernBERT marshaling (Family::ModernBert).
+// ---------------------------------------------------------------------------
+
+// A scalar initializer (the sliding window, the attention scale) as a double.
+static OrtStatus* ReadScalar(const OrtApi& api, const GraphMaps& m, const std::string& name, double* v) {
+  RawInit r;
+  if (OrtStatus* st = ReadInit(api, m, name, &r)) return st;
+  if (r.count != 1)
+    return api.CreateStatus(ORT_INVALID_GRAPH, ("ort-rocket: not a scalar: " + name).c_str());
+  switch (r.et) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   *v = *static_cast<const float*>(r.data); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: *v = (double)*static_cast<const _Float16*>(r.data); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:   *v = (double)*static_cast<const int64_t*>(r.data); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:   *v = *static_cast<const int32_t*>(r.data); break;
+    default: return api.CreateStatus(ORT_INVALID_GRAPH, ("ort-rocket: unsupported scalar type: " + name).c_str());
+  }
+  return nullptr;
+}
+
+// Heads from the attention-scale constant: SDPA's decomposition scales q and k each by dh^-1/4.
+static int HeadDimFromScale(double s) {
+  if (!(s > 0)) return 0;
+  const double dh4 = 1.0 / (s * s * s * s), dh2 = 1.0 / (s * s);
+  const int a = (int)std::lround(dh4), b = (int)std::lround(dh2);
+  if (a >= 8 && std::fabs(dh4 - a) < 1e-2 * a) return a;   // the split (q and k) spelling
+  if (b >= 8 && std::fabs(dh2 - b) < 1e-2 * b) return b;   // one scale on q
+  return 0;
+}
+
+// A projection resolved by the matcher, as torch [out][in] fp16 into `dst` (out x in).
+static OrtStatus* ProjF16(const OrtApi& api, const GraphMaps& m, const rocket_match::ProjWeight& w,
+                          int in, int out, _Float16* dst) {
+  std::vector<float> v;
+  if (OrtStatus* st = ReadTensorF32(api, m, w.tensor, &v)) return st;
+  if (w.rows_of < 0) {
+    if (v.size() != (size_t)in * out)
+      return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: projection weight size mismatch");
+    TransposeF16(v.data(), in, out, nullptr, dst);
+  } else {
+    if (v.size() != (size_t)w.nsplit * out * in)
+      return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: split projection weight size mismatch");
+    ToF16(v.data() + (size_t)w.rows_of * out * in, dst, (size_t)out * in);
+  }
+  return nullptr;
+}
+
+static OrtStatus* BiasF16(const OrtApi& api, const GraphMaps& m, const std::string& t, int rows_of,
+                          int n, _Float16* dst) {
+  std::vector<float> v;
+  if (OrtStatus* st = ReadTensorF32(api, m, t, &v)) return st;
+  const size_t off = rows_of < 0 ? 0 : (size_t)rows_of * n;
+  if (v.size() < off + n) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: bias size mismatch");
+  ToF16(v.data() + off, dst, (size_t)n);
+  return nullptr;
+}
+
+static OrtStatus* MarshalModernBert(const OrtApi& api, const GraphMaps& m,
+                                    const rocket_match::BackboneMatch& match, CompiledBackbone* cb) {
+  const rocket_match::ModernBertMatch& mb = match.mb;
+  rocket_modernbert_model& M = cb->mbm;
+  std::vector<float> v;
+  auto input_of = [&](const OrtNode* n, size_t i) -> std::string {
+    std::vector<std::string> in;
+    if (NodeInputNames(api, n, &in) || in.size() <= i) return std::string();
+    return in[i];
+  };
+  auto vec_f16 = [&](const std::string& t, size_t want, const _Float16** out) -> OrtStatus* {
+    if (OrtStatus* st = ReadTensorF32(api, m, t, &v)) return st;
+    if (v.size() != want)
+      return api.CreateStatus(ORT_INVALID_GRAPH, ("ort-rocket: vector size mismatch: " + t).c_str());
+    _Float16* p = cb->alloc(want);
+    ToF16(v.data(), p, want);
+    *out = p;
+    return nullptr;
+  };
+
+  // token table
+  RawInit tok;
+  if (OrtStatus* st = ReadInit(api, m, input_of(mb.tok_gather, 0), &tok)) return st;
+  if (tok.dims.size() != 2) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: token table is not 2D");
+  const int d = (int)tok.dims[1];
+  cb->mb_vocab = tok.dims[0];
+  if (OrtStatus* st = ReadTensorF32(api, m, input_of(mb.tok_gather, 0), &v)) return st;
+  {
+    _Float16* t = cb->alloc(v.size());
+    ToF16(v.data(), t, v.size());
+    cb->mb_tok = t;
+  }
+  M.d = d;
+  M.n_layers = (int)mb.layers.size();
+  if (M.n_layers > ROCKET_MB_MAX_LAYERS || (int)mb.post.size() > ROCKET_MB_MAX_POST)
+    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: more ModernBERT layers than the encoder holds");
+  M.eps = ReadFloatAttr(api, mb.emb_norm, "epsilon", 1e-5f);
+  if (OrtStatus* st = vec_f16(input_of(mb.emb_norm, 1), d, &M.emb_norm_g)) return st;
+  if (OrtStatus* st = vec_f16(input_of(mb.final_norm, 1), d, &M.final_norm_g)) return st;
+
+  int dh = 0, window = -1;
+  for (int l = 0; l < M.n_layers; l++) {
+    const rocket_match::MbLayer& L = mb.layers[l];
+    rocket_mb_layer& Y = M.layers[l];
+    if (OrtStatus* st = ReadTensorF32(api, m, L.inv_freq, &v)) return st;
+    cb->owned_f32.push_back(v);
+    Y.inv_freq = cb->owned_f32.back().data();
+    const int ldh = 2 * (int)v.size();
+    if (dh && ldh != dh) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: head dim varies by layer");
+    dh = ldh;
+    Y.sliding = !L.window.empty();
+    if (Y.sliding) {
+      double w = 0;
+      if (OrtStatus* st = ReadScalar(api, m, L.window, &w)) return st;
+      if (window >= 0 && (int)w != window)
+        return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: sliding window varies by layer");
+      window = (int)w;
+    }
+    if (L.attn_norm)
+      if (OrtStatus* st = vec_f16(input_of(L.attn_norm, 1), d, &Y.attn_norm_g)) return st;
+    if (OrtStatus* st = vec_f16(input_of(L.mlp_norm, 1), d, &Y.mlp_norm_g)) return st;
+    rocket_match::ProjWeight pw;
+    pw.tensor = input_of(L.wqkv, 1);
+    _Float16* w = cb->alloc((size_t)3 * d * d);
+    if (OrtStatus* st = ProjF16(api, m, pw, d, 3 * d, w)) return st;
+    Y.Wqkv = w;
+    pw.tensor = input_of(L.wo, 1);
+    w = cb->alloc((size_t)d * d);
+    if (OrtStatus* st = ProjF16(api, m, pw, d, d, w)) return st;
+    Y.Wo = w;
+    if (OrtStatus* st = ReadTensorF32(api, m, input_of(L.wi, 1), &v)) return st;
+    const int dff = (int)(v.size() / ((size_t)d * 2));
+    if (M.d_ff && dff != M.d_ff) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: d_ff varies by layer");
+    M.d_ff = dff;
+    pw.tensor = input_of(L.wi, 1);
+    w = cb->alloc((size_t)2 * dff * d);
+    if (OrtStatus* st = ProjF16(api, m, pw, d, 2 * dff, w)) return st;
+    Y.Wi = w;
+    pw.tensor = input_of(L.wo_mlp, 1);
+    w = cb->alloc((size_t)d * dff);
+    if (OrtStatus* st = ProjF16(api, m, pw, dff, d, w)) return st;
+    Y.Wo_mlp = w;
+  }
+  if (dh <= 0 || d % dh) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: RoPE width does not divide d");
+  M.n_head = d / dh;
+  M.window = window < 0 ? 0 : window;
+  {   // the scale must agree with the RoPE width (a mismatch means a different attention spelling)
+    double s = 0;
+    if (OrtStatus* st = ReadScalar(api, m, mb.layers[0].scale, &s)) return st;
+    if (HeadDimFromScale(s) != dh)
+      return api.CreateStatus(ORT_INVALID_GRAPH,
+          ("ort-rocket: attention scale " + std::to_string(s) + " does not match head dim " +
+           std::to_string(dh)).c_str());
+  }
+
+  if (mb.type_gather) {
+    RawInit ti;
+    if (OrtStatus* st = ReadInit(api, m, input_of(mb.type_gather, 0), &ti)) return st;
+    if (OrtStatus* st = ReadTensorF32(api, m, input_of(mb.type_gather, 0), &v)) return st;
+    cb->owned_f32.push_back(v);
+    cb->mb_type = cb->owned_f32.back().data();
+    cb->mb_ntype = ti.dims.empty() ? 0 : ti.dims[0];
+  }
+
+  M.n_post = (int)mb.post.size();
+  for (int j = 0; j < M.n_post; j++) {
+    const rocket_match::MbPost& P = mb.post[j];
+    rocket_mb_post_layer& Y = M.post[j];
+    if (j == 0) {
+      M.post_eps = ReadFloatAttr(api, P.ln1, "epsilon", 1e-5f);
+      double s = 0;
+      const int pdh = (!P.scale.empty() && !ReadScalar(api, m, P.scale, &s)) ? HeadDimFromScale(s) : 64;
+      if (pdh <= 0 || d % pdh) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: post head dim");
+      M.post_n_head = d / pdh;
+      M.post_act = P.gelu ? 1 : 0;
+    }
+    if (OrtStatus* st = vec_f16(input_of(P.ln1, 1), d, &Y.ln1_g)) return st;
+    if (OrtStatus* st = vec_f16(input_of(P.ln1, 2), d, &Y.ln1_b)) return st;
+    if (OrtStatus* st = vec_f16(input_of(P.ln2, 1), d, &Y.ln2_g)) return st;
+    if (OrtStatus* st = vec_f16(input_of(P.ln2, 2), d, &Y.ln2_b)) return st;
+    _Float16* w = cb->alloc((size_t)3 * d * d);
+    if (OrtStatus* st = ProjF16(api, m, P.q, d, d, w)) return st;
+    if (OrtStatus* st = ProjF16(api, m, P.k, d, d, w + (size_t)d * d)) return st;
+    if (OrtStatus* st = ProjF16(api, m, P.v, d, d, w + (size_t)2 * d * d)) return st;
+    Y.Wqkv = w;
+    _Float16* b = cb->alloc((size_t)3 * d);
+    if (P.q.bias.empty() || P.k.bias.empty() || P.v.bias.empty() || P.o.bias.empty() ||
+        P.w1.bias.empty() || P.w2.bias.empty())
+      return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: a post-layer projection has no bias");
+    if (OrtStatus* st = BiasF16(api, m, P.q.bias, P.q.bias_rows_of, d, b)) return st;
+    if (OrtStatus* st = BiasF16(api, m, P.k.bias, P.k.bias_rows_of, d, b + d)) return st;
+    if (OrtStatus* st = BiasF16(api, m, P.v.bias, P.v.bias_rows_of, d, b + 2 * d)) return st;
+    Y.bqkv = b;
+    w = cb->alloc((size_t)d * d);
+    if (OrtStatus* st = ProjF16(api, m, P.o, d, d, w)) return st;
+    Y.Wo = w;
+    b = cb->alloc(d);
+    if (OrtStatus* st = BiasF16(api, m, P.o.bias, P.o.bias_rows_of, d, b)) return st;
+    Y.bo = b;
+    if (OrtStatus* st = ReadTensorF32(api, m, P.w1.tensor, &v)) return st;
+    const int pff = (int)(v.size() / d);
+    if (M.post_d_ff && pff != M.post_d_ff) return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: post d_ff varies");
+    M.post_d_ff = pff;
+    w = cb->alloc((size_t)pff * d);
+    if (OrtStatus* st = ProjF16(api, m, P.w1, d, pff, w)) return st;
+    Y.W1 = w;
+    b = cb->alloc(pff);
+    if (OrtStatus* st = BiasF16(api, m, P.w1.bias, P.w1.bias_rows_of, pff, b)) return st;
+    Y.b1 = b;
+    w = cb->alloc((size_t)d * pff);
+    if (OrtStatus* st = ProjF16(api, m, P.w2, pff, d, w)) return st;
+    Y.W2 = w;
+    b = cb->alloc(d);
+    if (OrtStatus* st = BiasF16(api, m, P.w2.bias, P.w2.bias_rows_of, d, b)) return st;
+    Y.b2 = b;
+  }
+  return nullptr;
+}
+
+// The fused node's runtime inputs, by name: the token ids, the type ids, and the one remaining
+// non-initializer input (the attention mask), if any.
+static OrtStatus* MapModernBertInputs(const OrtApi& api, const OrtNode* fused, const GraphMaps& m,
+                                      const rocket_match::ModernBertMatch& mb, CompiledBackbone* cb) {
+  size_t nin = 0;
+  if (OrtStatus* st = api.Node_GetNumInputs(fused, &nin)) return st;
+  std::vector<const OrtValueInfo*> ins(nin);
+  if (OrtStatus* st = api.Node_GetInputs(fused, ins.data(), nin)) return st;
+  for (size_t i = 0; i < nin; i++) {
+    if (!ins[i]) continue;
+    const char* nm = nullptr;
+    if (OrtStatus* st = api.GetValueInfoName(ins[i], &nm)) return st;
+    if (!nm || m.init.count(nm)) continue;
+    if (mb.ids_input == nm) cb->mb_ids_idx = i;
+    else if (!mb.type_input.empty() && mb.type_input == nm) cb->mb_type_idx = i;
+    else if (cb->mb_mask_idx == CompiledBackbone::kNoInput) cb->mb_mask_idx = i;
+    else return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: more than one attention-mask-like input");
+  }
+  if (cb->mb_ids_idx == CompiledBackbone::kNoInput)
+    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: the token-id input is not on the fused node");
+  if (mb.type_gather && cb->mb_type_idx == CompiledBackbone::kNoInput)
+    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: the type-id input is not on the fused node");
+  return nullptr;
+}
+
+// Compile one claimed encoder subgraph (the family claim). `graph` is the fused subgraph, `fused` its
+// fused node; the compute info comes back in *out_info.
+static OrtStatus* CompileFamily(RocketEp* ep, const OrtGraph* graph, const OrtNode* fused,
+                                OrtNodeComputeInfo** out_info) {
   const OrtApi& api = ep->ort_api;
-  if (count != 1)
-    return api.CreateStatus(ORT_INVALID_ARGUMENT,
-                            "ort-rocket: expected exactly one fused backbone subgraph");
+  const OrtGraph* const* graphs = &graph;
+  const OrtNode* const* fused_nodes = &fused;
+  OrtNodeComputeInfo** node_compute_infos = out_info;
 
   auto cb = std::make_unique<CompiledBackbone>(api);
   cb->logger = &ep->logger;
-  cb->fd = rocket_open();
-  if (cb->fd < 0)
-    return api.CreateStatus(ORT_EP_FAIL,
-                            ("ort-rocket: rocket_open failed (" + std::to_string(cb->fd) +
-                             "); is /dev/accel/accel0 present and privileged?").c_str());
   // GetCapability already ran the structural match on the full graph and only claimed on success
   // (a non-matching graph is left entirely on CPU, never reaching here). This re-runs the match
   // on the fused subgraph -- which contains exactly the claimed nodes -- to drive edge-walk weight
@@ -2045,6 +2525,42 @@ OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** 
          match.reason + "); this is an internal inconsistency").c_str());
   GraphMaps maps;
   if (OrtStatus* st = stage(BuildMaps(api, graphs[0], maps), "BuildMaps")) return st;
+
+  // ModernBERT (with the Laya decision head as its post stack): the resident encoder opens its own
+  // worker fds, so this branch runs before the shared fd below. ROCKET_ORT_MB_HOST=1 selects the
+  // encoder's host mode (no device), which checks the whole EP path off-device.
+  if (match.family == rocket_match::Family::ModernBert) {
+    if (OrtStatus* st = stage(MarshalModernBert(api, maps, match, cb.get()), "MarshalModernBert")) return st;
+    if (OrtStatus* st = stage(MapModernBertInputs(api, fused_nodes[0], maps, match.mb, cb.get()),
+                              "MapModernBertInputs"))
+      return st;
+    int nthreads = 3;
+    if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 8) nthreads = v; }
+    if (const char* hz = std::getenv("ROCKET_ORT_MB_HOST")) if (std::atoi(hz) != 0) nthreads = 0;
+    cb->mbctx = rocket_modernbert_ctx_create(&cb->mbm, nthreads);
+    if (!cb->mbctx)
+      return api.CreateStatus(ORT_EP_FAIL,
+          "ort-rocket: ModernBERT ctx create failed (the device, or a weight pack past the IOVA window)");
+    cb->is_mb = true;
+    const rocket_modernbert_model& M = cb->mbm;
+    int nslide = 0;
+    for (int l = 0; l < M.n_layers; l++) nslide += M.layers[l].sliding;
+    ep->Log(ORT_LOGGING_LEVEL_INFO,
+            "ort-rocket: ModernBERT encoder compiled; d=" + std::to_string(M.d) + " heads=" +
+                std::to_string(M.n_head) + " layers=" + std::to_string(M.n_layers) + " (" +
+                std::to_string(nslide) + " sliding, window " + std::to_string(M.window) + ") d_ff=" +
+                std::to_string(M.d_ff) + " post=" + std::to_string(M.n_post) + " vocab=" +
+                std::to_string(cb->mb_vocab) + ", mode=" + (nthreads ? "npu" : "host"));
+    auto info = std::make_unique<BackboneComputeInfo>(cb.release());
+    node_compute_infos[0] = info.release();
+    return nullptr;
+  }
+
+  cb->fd = rocket_open();
+  if (cb->fd < 0)
+    return api.CreateStatus(ORT_EP_FAIL,
+                            ("ort-rocket: rocket_open failed (" + std::to_string(cb->fd) +
+                             "); is /dev/accel/accel0 present and privileged?").c_str());
 
   // Depth Anything v2: the DINOv2 encoder marshals into the plain-ViT compute (LayerScale folded
   // into the projections, the fused qkv sliced by its derived column blocks), configured to emit one
@@ -2233,14 +2749,43 @@ OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** 
   return nullptr;
 }
 
+// ONNX Runtime hands every fused node of the session to one Compile call: at most one encoder
+// subgraph, and one single-node graph per claimed ConvTranspose.
+OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** graphs,
+                                              const OrtNode** fused_nodes, size_t count,
+                                              OrtNodeComputeInfo** node_compute_infos,
+                                              OrtNode** /*ep_context_nodes*/) noexcept {
+  auto* ep = static_cast<RocketEp*>(this_ptr);
+  const OrtApi& api = ep->ort_api;
+  size_t n_family = 0;
+  for (size_t i = 0; i < count; i++) {
+    node_compute_infos[i] = nullptr;
+    OrtStatus* st = nullptr;
+    if (rocket_convt::IsConvTGraph(api, graphs[i])) {
+      st = rocket_convt::Compile(api, ep->logger, ep->ct_shared, graphs[i], fused_nodes[i],
+                                 &node_compute_infos[i]);
+    } else if (++n_family > 1) {
+      st = api.CreateStatus(ORT_INVALID_ARGUMENT,
+                            "ort-rocket: expected at most one fused encoder subgraph");
+    } else {
+      st = CompileFamily(ep, graphs[i], fused_nodes[i], &node_compute_infos[i]);
+    }
+    if (st) {   // free what this call built; the session will not run
+      for (size_t j = 0; j <= i; j++) {
+        delete static_cast<rocket_convt::ComputeInfoBase*>(node_compute_infos[j]);
+        node_compute_infos[j] = nullptr;
+      }
+      return st;
+    }
+  }
+  return nullptr;
+}
+
 void ORT_API_CALL RocketEp::ReleaseNodeComputeInfosImpl(OrtEp* /*this_ptr*/,
                                                         OrtNodeComputeInfo** infos,
                                                         size_t count) noexcept {
-  for (size_t i = 0; i < count; i++) {
-    auto* info = static_cast<BackboneComputeInfo*>(infos[i]);
-    delete info->state;
-    delete info;
-  }
+  for (size_t i = 0; i < count; i++)
+    delete static_cast<rocket_convt::ComputeInfoBase*>(infos[i]);   // an encoder's or a ConvTranspose's
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,14 +2850,27 @@ struct RocketEpFactory : OrtEpFactory {
   static OrtStatus* ORT_API_CALL CreateEpImpl(OrtEpFactory* this_ptr,
                                               const OrtHardwareDevice* const* /*devices*/,
                                               const OrtKeyValuePairs* const* /*ep_metadata*/,
-                                              size_t num_devices, const OrtSessionOptions* /*so*/,
+                                              size_t num_devices, const OrtSessionOptions* so,
                                               const OrtLogger* logger, OrtEp** ep) noexcept {
     auto* f = static_cast<RocketEpFactory*>(this_ptr);
+    const OrtApi& api = f->ort_api;
     *ep = nullptr;
     if (num_devices != 1)
-      return f->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
-                                     "ort-rocket EP is registered for a single CPU device only");
-    *ep = std::make_unique<RocketEp>(f->ort_api, f->name, *logger).release();
+      return api.CreateStatus(ORT_INVALID_ARGUMENT,
+                              "ort-rocket EP is registered for a single CPU device only");
+    auto e = std::make_unique<RocketEp>(api, f->name, *logger);
+    const char* kSpin = "session.intra_op.allow_spinning";
+    int has = 0;
+    if (so) {
+      if (OrtStatus* st = api.HasSessionConfigEntry(so, kSpin, &has)) { api.ReleaseStatus(st); has = 0; }
+    }
+    if (has) {
+      char v[16] = {0};
+      size_t n = sizeof(v);
+      if (OrtStatus* st = api.GetSessionConfigEntry(so, kSpin, v, &n)) api.ReleaseStatus(st);
+      else e->intra_spin = std::strcmp(v, "0") != 0;
+    }
+    *ep = e.release();
     return nullptr;
   }
 

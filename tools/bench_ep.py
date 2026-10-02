@@ -11,10 +11,12 @@ its own LayerNorm/Gelu/MatMul fusions and flatter the NPU. A cold run is discard
 N warm runs is reported, with the speedup cpu/ep.
 
 The input .npy is an NCHW tensor of the shape the model expects (e.g. [1,3,224,224] for SigLIP-B/16,
-[1,3,1024,1024] for SAM-ViT-B). The per-family tests under tests/ save such reference inputs.
+[1,3,1024,1024] for SAM-ViT-B). The per-family tests under tests/ save such reference inputs. A
+multi-input model (the Laya decision model: input_ids, attention_mask, marker_pos, marker_mask,
+qtype) takes an .npz instead, whose arrays are named for the inputs, bare or with an `in_` prefix.
 
 Run with sudo -E so the /dev/accel privilege and the ROCKET_* env both survive:
-  sudo -E .../python tools/bench_ep.py <lib.so> <model.onnx> <input.npy> [--iters N] [--threads T]
+  sudo -E .../python tools/bench_ep.py <lib.so> <model.onnx> <input.npy|.npz> [--iters N] [--threads T]
 """
 import argparse
 import os
@@ -43,19 +45,24 @@ def main():
     ap = argparse.ArgumentParser(description="ort-rocket EP vs CPU-EP single-stream latency")
     ap.add_argument("lib", help="path to libonnxruntime_rocket.so")
     ap.add_argument("onnx", help="path to the .onnx model")
-    ap.add_argument("npy", help="path to an NCHW input tensor (.npy)")
+    ap.add_argument("npy", help="an NCHW input tensor (.npy), or named inputs (.npz)")
     ap.add_argument("--iters", type=int, default=20, help="warm iterations (default 20)")
     ap.add_argument("--threads", type=int, default=8, help="intra-op threads (default 8)")
     args = ap.parse_args()
-    x = np.load(args.npy)
 
     # CPU EP, graph opt ON, all threads -- the honest baseline a CPU-only user runs.
     so_cpu = ort.SessionOptions()
     so_cpu.intra_op_num_threads = args.threads
     so_cpu.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     cpu = ort.InferenceSession(args.onnx, so_cpu, providers=["CPUExecutionProvider"])
-    in_name = cpu.get_inputs()[0].name
-    feeds = {in_name: x}
+    if args.npy.endswith(".npz"):
+        z = np.load(args.npy)
+        feeds = {}
+        for i in cpu.get_inputs():
+            key = i.name if i.name in z.files else "in_" + i.name
+            feeds[i.name] = z[key]
+    else:
+        feeds = {cpu.get_inputs()[0].name: np.load(args.npy)}
     cpu_med, cpu_min, cpu_p90 = warm_median(cpu, feeds, args.iters)
 
     # ort-rocket EP, graph opt OFF (the matcher keys on the raw exported op topology).

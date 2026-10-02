@@ -1,15 +1,16 @@
 # ort-rocket: API and tuning reference
 
-The per-family faithfulness and performance detail, the quantized-model behavior, the complete
-`ROCKET_ORT_*` knob table, and the matcher and implementation notes. The [README](README.md) is
+The per-family faithfulness and performance detail, the ConvTranspose claim, the quantized-model
+behavior, the complete `ROCKET_ORT_*` knob table, and the matcher and implementation notes. The [README](README.md) is
 the guide, and this is the reference.
 
 ## Model families
 
-The EP recognizes five transformer vision families by graph topology and offloads each one's
-encoder. One on-NPU ViT primitive is reused across all of them: patch-embed conv, LayerNorm,
-multi-head self-attention, FFN and GELU. The compute is the `rocket-userspace` DINOv2 and plain-ViT
-encoder path, validated at both d=384 and d=768.
+The EP recognizes six transformer families by graph topology and offloads each one's encoder:
+five vision families and one text family. One on-NPU ViT primitive is reused across the vision
+families: patch-embed conv, LayerNorm, multi-head self-attention, FFN and GELU. The compute is the
+`rocket-userspace` DINOv2 and plain-ViT encoder path, validated at both d=384 and d=768. The text
+family runs the `rocket-userspace` ModernBERT encoder.
 
 All faithfulness figures are in-process against the ONNX Runtime CPU EP on the same input. All
 latency figures are warm, RK3588 @ 600 MHz, resident, one A76-pinned stream. [HW sweep]
@@ -77,6 +78,114 @@ It ships for coverage and pool throughput rather than single-stream.
 The Base variant (d=768) is matcher-supported and projects better. It is not expected to turn
 single-stream positive, because attention cost scales with sequence length and width does not
 shrink that. Small is the device-validated one.
+
+### ModernBERT text encoders (the Laya decision model)
+
+Offloads a ModernBERT encoder and an optional stack of torch pre-norm transformer layers after it
+(`nn.TransformerEncoderLayer` with `norm_first`) as one fused node. The node takes the token ids,
+the attention mask and a per-sequence type id, and emits the last layer's hidden states. RoPE,
+global and sliding layers, GeGLU and the bias-less LayerNorms are read from the graph, including
+each layer's RoPE frequencies and the sliding window. Validated on `convaiinnovations/laya` at
+revision `55cf4c4e`: English and typed-decisions are ModernBERT-large (d=1024, 28 layers),
+multilingual is mmBERT-base (d=768, 22 layers). Laya's marker gather, scorer and action MLPs stay on
+the CPU.
+
+A batch is B right-padded sequences, one per question. Each runs at its own length, so padding
+costs nothing. Every projection runs once over the live rows of the whole batch. Each row of the
+attention mask must be a prefix of ones, and Compute refuses a row that is not.
+
+Faithfulness, against the CPU EP on 13 recorded requests (48-726 tokens, batches of 1 and 3):
+every answer agrees, and the largest option-probability difference is 5.1e-4. The residual
+stream stays fp32 on the host, because ModernBERT-large's reaches 29000, where fp16 rounds to 16.
+
+Single-stream against the CPU EP at `ORT_ENABLE_ALL` with ONNX Runtime's default thread count,
+which ran this graph faster than 8 threads (1343 against 1580 ms on a 3-question request). Warm,
+two rotated passes, a process per arm. [HW sweep]
+
+| Checkpoint | Request | CPU EP | ort-rocket | Speedup |
+|---|---|---:|---:|---:|
+| English | 48 tokens | 376 ms | 223-230 ms | 1.66x |
+| English | 3 questions, 53 tokens | 1226 ms | 431 ms | 2.85x |
+| English | 512 tokens | 4848-4933 ms | 1570-1578 ms | 3.11x |
+| typed decisions | 58 tokens | 458 ms | 242-247 ms | 1.87x |
+| typed decisions | 639 tokens | 6487-6497 ms | 2053-2247 ms | 3.03x |
+| multilingual | 58 tokens | 154 ms | 137 ms | 1.12x |
+| multilingual | 3 questions, 58 tokens | 404-405 ms | 266-285 ms | 1.47x |
+| multilingual | 726 tokens | 2872-3907 ms | 1248-1604 ms | 2.46x |
+
+**Exporting.** Laya's own `scripts/export_onnx.py` traces a batch-1 dummy. Under torch 2.9 and
+later, `torch.onnx.export` defaults to the dynamo exporter, which bakes that batch into the head's
+reshape. Every request with more than one question then fails inside ONNX Runtime. Export
+with a batch-2 dummy and `dynamic_shapes`, or pass `dynamo=False`. The EP is validated on the dynamo
+graph.
+
+**Using Laya's `ONNXAgent`.** The agent builds its session with the CUDA or CPU provider at
+`ORT_ENABLE_ALL`. Build an ort-rocket session at `ORT_DISABLE_ALL` and assign it to the agent's
+`session` attribute after construction. Its tokenization and decoding then run unchanged.
+
+## ConvTranspose
+
+Besides the encoder families, the EP claims ONNX `ConvTranspose` nodes one at a time, in any graph,
+each as a fused node of its own. Each runs on the `rocket-userspace` resident transposed
+convolution. That is one resident fp16 matmul over the input's channel planes, then a scatter-add
+of the kernel taps on the host. The claim coexists with a family claim. A ConvTranspose inside a
+claimed encoder stays part of it. One outside it is claimed on its own, such as the two in Depth
+Anything's DPT head.
+
+**What is claimed.** A 2-D ConvTranspose with `group` 1 and fp32 input and output. Its weight is a
+constant fp32 initializer, and so is its bias if it has one. Its `auto_pad` is `NOTSET` or `VALID`,
+and it carries no `output_shape` attribute. Its trailing pads are at most its leading pad plus
+`output_padding`, and the entry's planner accepts its shape.
+
+Everything else stays on ONNX Runtime's CPU kernel. That covers depthwise and grouped transposes,
+`SAME` padding, an `output_shape` attribute, a weight computed in the graph, and a QDQ model's
+dequantized weight. At `INFO` the session log counts the nodes it left on the CPU, by reason.
+
+The weight is packed once per node when the session is created. Every claimed ConvTranspose shares
+one NPU context. An input height or width that is symbolic in the graph packs at the first run
+that sees each size, as in SAM's mask decoder. A size past the entry's bound runs on an fp32 host
+path, so a claimed node never fails a run for its shape. A batch runs as one call per image. Graph
+optimization does not affect this claim, which works at `ORT_ENABLE_ALL`.
+
+**Set `session.intra_op.allow_spinning` to `0`.** With spinning on, ONNX Runtime's idle intra-op
+threads spin while each claimed node runs and take the cores its NPU workers and scatter-add need.
+On pix2pix at 4 threads that costs 17 ms of an 83 ms run. The CPU EP alone is unaffected by the
+setting (146 ms either way). The EP logs one warning when it claims a ConvTranspose in a session
+that spins.
+
+```python
+so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+```
+
+Faithfulness is scored against the CPU EP, element by element. The per-node gate runs every
+ConvTranspose of pix2pix and of SAM's mask decoder. Each runs with the model's own weights and the
+input the node receives in the model. The worst error is 2^-11.6 to 2^-10.4 of the element's
+magnitude sum, the sum over taps of `abs(x w)` plus the bias.
+
+The pix2pix facades generator's output image differs by at most 3.7e-3 end to end. Its PSNR is 80.8 dB on a structured label map
+and 77.1 dB on uniform noise. SAM's masks agree at a per-mask IoU of 0.9975 or better at one point.
+At 64 points the worst of 192 masks is 0.9931, and the mean 0.9992. SAM's IoU predictions do not
+depend on the upscaler and are unchanged. [HW sweep]
+
+The table is single-stream against the CPU EP at `ORT_ENABLE_ALL` with the sequential executor.
+Both arms use the same intra-op thread count, and the EP arm turns spinning off. Each figure is a
+warm median over six rotated passes (four at 64 points), with each ratio paired within its pass. At 4 threads both arms
+run on the four A76 cores. At 2 threads the CPU arm runs on two A76 cores. The EP arm runs on four,
+or on the same two with `ROCKET_CPU_AFFINITY`. [HW sweep]
+
+| Model | ConvTranspose share of the CPU run | Threads | CPU EP | ort-rocket | Speedup |
+|---|---:|---:|---:|---:|---:|
+| pix2pix facades U-Net-256 generator | 65% | 4 | 146.0 ms | 82.9 ms | 1.76x |
+| pix2pix facades U-Net-256 generator | 66% | 2 | 258.3 ms | 120.3 ms (121.1 on the same two cores) | 2.15x (2.13x) |
+| SAM ViT-B mask decoder, 1 point | 18% | 4 | 82.6 ms | 78.8 ms | 1.05x |
+| SAM ViT-B mask decoder, 1 point | 18% | 2, spinning on | 136.0 ms | 123.3 ms | 1.10x |
+| SAM ViT-B mask decoder, 64 points | 22% | 4 | 4751.6 ms | 4337.9 ms | 1.10x |
+| SAM ViT-B mask decoder, 64 points | 20% | 2 | 7871.4 ms | 6847.0 ms | 1.15x |
+
+The speedup follows the share. Inside the model at 4 threads the EP runs each node in 0.20-0.86x
+the CPU kernel's time, conversions included. The exception is pix2pix's first layer, a 1x1 input
+against an 8 MB weight, at 1.55x (1.63 against 1.05 ms). So a model gains little unless
+ConvTranspose dominates it. `ROCKET_ORT_CONVTRANSPOSE=0` turns the claim off.
 
 ## The performance envelope
 
@@ -172,7 +281,7 @@ strips the environment, so always use `sudo -E`.
 | var | default | meaning |
 |---|---|---|
 | `ROCKET_ORT_RESIDENT` | on | Resident prepacked-multicore encoder ctx: pack static weights once, re-pack only activations per image. `=0` uses the one-shot per-call chain (simpler, slower) |
-| `ROCKET_ORT_THREADS` | 3 | NPU worker count (clamped 1-16), fanned across the 3 NPU cores |
+| `ROCKET_ORT_THREADS` | 3 | NPU worker count (clamped 1-16), fanned across the 3 NPU cores; also the ConvTranspose context's |
 | `ROCKET_ORT_SIGLIP_HEADS` | d/64 | Attention head count for the plain-ViT / SigLIP / CLIP / Depth families; required when d is not a multiple of 64 (the EP errors with the value to set) |
 | `ROCKET_ORT_HT` | 4 (1 if single-threaded) | Host LayerNorm / GELU fan-out width across A76 cores (clamped 1-8) |
 | `ROCKET_ORT_PIN` | on | Pin host workers to A76 big cores; `=0` (unpinned) lets the OS spread streams across all cores, the RF-DETR process-pool recipe |
@@ -181,11 +290,14 @@ strips the environment, so always use `sudo -E`.
 | `ROCKET_ORT_INT8` | off | Native W8A8 int8 encoder GEMMs (faithful, ~1.8x slower) |
 | `ROCKET_ORT_STRICT` | off | With `ROCKET_ORT_INT8`, escalate a marshaling miss from silent fp16 fallback to a hard Compile failure + self-check summary |
 | `ROCKET_ORT_I8_MASK` | 0x1F | Bitmask selecting which of the 5 encoder GEMMs run int8 (A/B diagnostic) |
-| `ROCKET_ORT_PROF` | off | Print a per-phase timing breakdown (attention / projections / LayerNorm / scatter) at exit |
+| `ROCKET_ORT_PROF` | off | Print a per-phase timing breakdown (attention / projections / LayerNorm / scatter) at exit, and per claimed ConvTranspose its per-call input conversion, NPU entry and output conversion time |
+| `ROCKET_ORT_CONVTRANSPOSE` | on | `=0` leaves every ConvTranspose on ONNX Runtime's CPU kernel |
+| `ROCKET_ORT_MB_HOST` | off | ModernBERT only: run the encoder's host mode (no device, every GEMM and attention on the CPU). An off-device check of the whole EP path |
 
 ## Matcher and implementation notes
 
-- **Graph optimization must be disabled** (`ORT_DISABLE_ALL`). The matcher recognizes the raw
+- **Graph optimization must be disabled** (`ORT_DISABLE_ALL`) for a family claim. The ConvTranspose
+  claim does not depend on it. The matcher recognizes the raw
   exported op topology. ONNX Runtime's Gemm, Gelu and SkipLayerNorm fusions engage from
   `ORT_ENABLE_BASIC` up. They rewrite the encoder block into a topology the matcher does not
   model, so the model falls back entirely to the CPU. Recognizing the fused forms is a known follow-on.
@@ -196,6 +308,11 @@ strips the environment, so always use `sudo -E`.
   a fixed order and claims the first match, and a re-export that renames interior tensors still
   matches. Over-claiming would silently corrupt output, because there is no fallback once claimed.
   So every signature ships with an off-device oracle test before it claims on device.
+- **The matcher runs on two graphs.** `GetCapability` matches the whole model and `Compile` the
+  fused subgraph, where the claimed exit is a graph output with no consumers. The ModernBERT walk
+  therefore anchors on the encoder side only: the token-embedding Gather, then each layer along
+  its residual chain. A per-layer backward walk resolves that layer's RoPE table and sliding band.
+  It stops at the layer's input and at `Shape` nodes, which otherwise lead it into earlier layers.
 - **The resident context** packs the static weights into NPU buffers once at `Compile` and fans
   attention across the NPU cores, and each image re-packs only its activations.
   `ROCKET_ORT_RESIDENT=0` falls back to a per-call chain.

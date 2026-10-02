@@ -2,25 +2,26 @@
 
 ## AI disclosure
 
-Except for the prior work it builds on, ort-rocket was developed by AI, primarily
-Claude Code (Opus 4.8). Human involvement was mostly limited to setting project goals and
-providing hardware access. This is a side project for curiosity's sake and comes with no
-guarantee of quality, accuracy, or update frequency.
+Except for the prior work it builds on, ort-rocket was developed by AI, primarily Claude. Human
+involvement was mostly limited to setting project goals and providing hardware access. This is a
+side project for curiosity's sake and comes with no guarantee of quality, accuracy, or update
+frequency.
 
 ## About ort-rocket
 
 An ONNX Runtime execution provider for Rockchip NPUs (validated on the RK3588) via the mainline
-`rocket` DRM-accel driver. It offloads the encoder of transformer vision models, meaning ViT
-backbones and their conv necks, to the NPU through the standalone `rocket-userspace` driver
-library. Everything it does not claim falls back to ONNX Runtime's own CPU kernels:
-deformable-attention sampling, detection heads, pooling heads and other host ops.
+`rocket` DRM-accel driver. It offloads transformer encoders to the NPU through the standalone
+`rocket-userspace` driver library: ViT backbones and their conv necks, and ModernBERT text
+encoders. In any model it also offloads the `ConvTranspose` layers, one node at a time. Everything
+it does not claim falls back to ONNX Runtime's own CPU kernels: deformable-attention sampling,
+detection heads, pooling heads and other host ops.
 
 It builds as a runtime-loadable plugin execution provider `.so`, which stock ONNX Runtime loads
 via `register_execution_provider_library`. The NPU then appears as a selectable device, exactly
 like ONNX Runtime's other execution providers. Any ONNX Runtime application can load it and run an
 unmodified `.onnx` model.
 
-Five model families are recognized and offloaded today, identified by graph topology rather than
+Six model families are recognized and offloaded today, identified by graph topology rather than
 exporter-generated tensor names:
 
 - **RF-DETR** (nano + base): the DINOv2 ViT backbone and the CSP feature projector. The
@@ -31,9 +32,18 @@ exporter-generated tensor names:
   decomposed relative-position bias, plus the conv neck. The prompt encoder and mask decoder
   stay on the CPU.
 - **Depth Anything v2**: the DINOv2 backbone. The DPT depth head stays on the CPU.
+- **ModernBERT** text encoders, with an optional stack of torch pre-norm transformer layers
+  after them: the encoder and those layers, over a batch of variable-length sequences. Validated
+  on the Laya decision model, whose marker scoring and action heads stay on the CPU.
 
-A graph outside that set runs entirely on ONNX Runtime's CPU kernels, unchanged. So does one
-whose recognizable topology has been rewritten by graph optimization, described below.
+Separately from the families, the EP claims each `ConvTranspose` node it can run, in any graph and
+at any graph-optimization level. It takes a 2-D, `group` 1, fp32 node with a constant weight. Generators and
+decoders whose upsampling is a learned transposed convolution gain the most, such as pix2pix, where
+it is two thirds of the CPU run. Depthwise and grouped transposes stay on the CPU.
+
+A graph outside that set runs on ONNX Runtime's CPU kernels, except for its `ConvTranspose` nodes.
+So does one whose recognizable encoder topology has been rewritten by graph optimization, described
+below.
 
 ```
 .
@@ -68,6 +78,9 @@ column with [`tools/bench_ep.py`](tools/bench_ep.py) and the pool column with
 | RF-DETR nano | DINOv2 ViT-S, d=384, windowed | 1.03x | ~1.6x | COCO mAP 0.5049 vs 0.5051 (500-img) |
 | SAM ViT-B | ViT-Det, d=768, 4096 tok | 1.03-1.11x | ~1.71x | enc cos 0.9999995, mask-IoU 0.9998 |
 | Depth Anything v2 Small | DINOv2 ViT-S, d=384, global 1370 tok | 0.78x | n/a | depth cos 0.9999999 |
+| Laya English | ModernBERT-large, d=1024, 48-512 tok | 1.66-3.11x | n/a | answers agree 4/4, max prob diff 5.1e-4 |
+| Laya typed decisions | ModernBERT-large, d=1024, 58-639 tok | 1.87-3.03x | n/a | answers agree 3/3, max prob diff 3.3e-4 |
+| Laya multilingual | mmBERT-base, d=768, 56-726 tok | 1.12-2.46x | n/a | answers agree 6/6, max prob diff 3.3e-4 |
 
 **Which models win is predictable.** The NPU runs the projection GEMMs, the large-K matmuls,
 about 2.7x more efficiently per-MAC than attention. Attention's score matmul contracts over the
@@ -88,6 +101,12 @@ global-attention encoder (Depth Anything Small) is the first to lose single-stre
 encoder helps (d=768 beats d=384) by raising the projection share, but it cannot shrink an
 attention cost that only sequence length controls.
 
+The screen prices the NPU's side and holds the CPU's per-MAC rate fixed. That holds across the
+vision families and not for the text one. ONNX Runtime's CPU kernels run the Laya graph, a d=1024
+encoder with masked fp32 attention, at ~77 GOP/s. So Laya reads 3.03x at an `ntok/4d` of 0.16,
+where the vision families predict parity. The low end of each Laya range is its
+shortest request, where the NPU's per-call dispatch dominates.
+
 **Throughput is the headline.** A single encode is partly host-bound, in score readback,
 softmax, layout and the CPU tail. So the NPU's value is running one process per stream, and P=4
 peaks the 3-core NPU.
@@ -103,6 +122,22 @@ that workload. Reproduce the vs-CPU-pool ratio with
 [`tools/bench_pool.py`](tools/bench_pool.py). The encoder-only families (CLIP/SigLIP/SAM) also
 have a ~100% offload share, so no host tail dilutes the encoder's edge.
 
+**ConvTranspose** layers gain in proportion to their share of the model. Inside the model the EP
+runs each in 0.2-0.9x the CPU kernel's 4-thread time. A layer with almost no input is the
+exception, such as pix2pix's first, at 1.6x. Each output is within 2^-10.4 of its magnitude sum.
+The figures are against the CPU EP at `ORT_ENABLE_ALL` with the same intra-op thread count, warm
+medians over four to six rotated passes. [HW sweep]
+
+| Model | ConvTranspose share | 4 threads | 2 threads | Faithfulness vs CPU EP |
+|---|---:|---:|---:|---|
+| pix2pix facades generator | 65% | 1.76x | 2.15x | image max abs 3.7e-3, PSNR 80.8 dB |
+| SAM ViT-B mask decoder, 1 point | 18% | 1.05x | 1.10x (spinning on) | mask IoU >= 0.9975 |
+| SAM ViT-B mask decoder, 64 points | 22% | 1.10x | 1.15x | worst of 192 masks IoU 0.9931 |
+
+Those figures run the EP session with `session.intra_op.allow_spinning` set to `0`. With ONNX
+Runtime's default, its idle threads spin through each offloaded node, and pix2pix at 4 threads
+drops to 1.46x.
+
 The remaining lever is a tiled, fused global-attention pass, an FA-2-style running softmax that
 keeps the `ntok x ntok` scores off the host DMA path. It would lift both the single-stream number
 and the pool ceiling for the attention-bound models (SAM's four global layers, Depth Anything's
@@ -110,8 +145,8 @@ every layer). It is the obvious next contribution.
 
 ## What runs on the NPU
 
-The EP claims one encoder subgraph per recognized family and hands everything else back to ONNX
-Runtime:
+The EP claims one encoder subgraph per recognized family, and each `ConvTranspose` it can run, and
+hands everything else back to ONNX Runtime:
 
 **Offloaded**, in each case to the NPU:
 
@@ -121,23 +156,29 @@ Runtime:
 - SAM's windowed and global attention, with on-chip decomposed relative-position bias, and its
   conv neck.
 - Depth Anything's four intermediate encoder taps.
+- ModernBERT's encoder and its post-encoder transformer layers, including RoPE, global and
+  banded sliding attention, and GeGLU.
+- `ConvTranspose` layers in any model, such as a U-Net generator's upsampling path, SAM's two mask
+  upscalers and the DPT head's reassemble upsampling.
 
 **Host**, on ONNX Runtime's CPU kernels:
 
 - Deformable-attention `GridSample` sampling and the DETR detection head (RF-DETR).
 - The attention-pool and cls-token pooling heads (SigLIP/CLIP).
-- The prompt encoder and mask decoder (SAM).
+- The prompt encoder and mask decoder (SAM), except the decoder's two `ConvTranspose` upscalers.
 - The DPT reassemble and fusion head, and its `align_corners` resizes (Depth Anything).
+- The token-marker gather, scorer and action heads (Laya), a few small MLPs over a handful of rows.
 
 None of these has an NPU route. `GridSample` and `align_corners` resize both need a gather the
 RK3588 NPU lacks, and each is a small share of its model.
 
-**Graph optimization must be off.** The matcher keys on the exported op topology, so the
-session must run with `ORT_DISABLE_ALL`. ONNX Runtime's Gemm, Gelu and LayerNorm fusions engage
+**Graph optimization must be off for a family claim.** The matcher keys on the exported op
+topology, so the session must run with `ORT_DISABLE_ALL`. The `ConvTranspose` claim does not
+depend on it. ONNX Runtime's Gemm, Gelu and LayerNorm fusions engage
 from `ORT_ENABLE_BASIC` up. They rewrite the encoder block into a topology the matcher does not
 model, and the
-model then runs entirely on the CPU. A graph that is not one of the five families, or whose
-optimizations were left on, is left on the CPU, never mis-claimed.
+model then runs on the CPU, apart from any `ConvTranspose`. A graph that is not one of the six
+families, or whose optimizations were left on, is left on the CPU, never mis-claimed.
 
 **Quantized models.** The EP consumes int8 and int4 QDQ ONNX, ONNX Runtime's `quantize_static`
 format. By default it dequantizes the weights to fp16 and runs the same fp16 datapath, which is
@@ -166,6 +207,9 @@ A plugin execution provider, meaning an out-of-tree EP shared library:
   patch-embed and neck convs. Family-distinctive nodes complete it, such as SAM's
   relative-position Einsums or Depth Anything's four-tap DPT exit. A re-export that renames the
   interior still matches.
+- The same `GetCapability` pass then claims each eligible `ConvTranspose` outside the family claim
+  as a fused node of its own. `Compile` packs its weight once into the NPU buffers of one context
+  shared by all of them.
 
 ## Requirements
 
@@ -212,7 +256,15 @@ outputs = sess.run(None, {"input": x})
 ```
 
 The provider loads for any ONNX Runtime application and runs an unmodified `.onnx` model. The
-NPU offload activates for a recognized encoder, and any other graph runs on the CPU.
+NPU offload activates for a recognized encoder and for `ConvTranspose` nodes, and everything else
+runs on the CPU.
+
+For a model whose `ConvTranspose` layers are offloaded, turn off intra-op spinning, or ONNX
+Runtime's idle threads take the cores the offloaded node needs:
+
+```python
+so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+```
 
 For a CLIP, SigLIP or Depth-Anything variant whose attention head dimension is not 64, set
 `ROCKET_ORT_SIGLIP_HEADS` to the head count. The EP reports the required value if it cannot infer

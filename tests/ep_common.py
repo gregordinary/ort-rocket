@@ -28,7 +28,7 @@ class EpSession:
     """An ort-rocket session with the profiler on. Use as a context manager: the session is
     released BEFORE the library is unregistered, or teardown touches freed factory state."""
 
-    def __init__(self, ep_lib, onnx_path, reg_name="rocket", log_level=2):
+    def __init__(self, ep_lib, onnx_path, reg_name="rocket", log_level=2, opt_level=None):
         self.reg_name = reg_name
         self.profile_dir = tempfile.mkdtemp(prefix="ort_rocket_prof_")
         ort.register_execution_provider_library(reg_name, os.path.abspath(ep_lib))
@@ -36,8 +36,10 @@ class EpSession:
         assert devs, f"EP '{reg_name}' not registered as a device"
         so = ort.SessionOptions()
         so.log_severity_level = log_level
-        # The matcher keys on the raw exported topology, which ONNX Runtime's fusions rewrite.
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        # The matcher keys on the raw exported topology, which ONNX Runtime's fusions rewrite. A
+        # ConvTranspose-only claim does not depend on it, so its tests may pass another level.
+        so.graph_optimization_level = (ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+                                       if opt_level is None else opt_level)
         so.enable_profiling = True
         so.profile_file_prefix = os.path.join(self.profile_dir, "ep")
         so.add_provider_for_devices([devs[0]], {})
