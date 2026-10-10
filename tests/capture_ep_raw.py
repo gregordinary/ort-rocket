@@ -30,7 +30,7 @@ def main():
     in_name = sess.get_inputs()[0].name
     names = [o.name for o in sess.get_outputs()]
     out = dict(zip(names, sess.run(None, {in_name: x})))
-    del sess
+    del sess, so, devs   # nothing that references the EP may outlive the library
     import gc
     gc.collect()
     ort.unregister_execution_provider_library(REG_NAME)

@@ -27,6 +27,7 @@ from ep_common import EpSession, check_not_identical, check_placement
 
 DEPTH_COS = 0.9999   # exit gate: depth-map cosine vs the CPU EP
 TAP_COS = 0.999      # exit gate: per-tap encoder cosine vs the CPU EP
+REUSE_COS = 0.999999 # exit gate: the reference image after another, vs its first answer
 NRUNS = 5            # timed warm runs per session (median reported)
 
 
@@ -134,6 +135,10 @@ def main():
     # the library, or teardown segfaults. Its profiler adds a small per-node cost to the EP arm.
     with EpSession(ep_lib, onnx_path, "rocket", log_level=1) as sep:
         got, t_ep, ts_ep = timed(sep)                  # Compile already packed the weights
+        # The encoder's context keeps its scratch across images, and a repeated input cannot show
+        # one image's state reaching the next. Run another image, then this one again.
+        sep.run(want, {in_name: np.ascontiguousarray(x[..., ::-1, ::-1])})
+        again = sep.run(want, {in_name: x})
 
     ok = check_placement(sep.placement)
     ok = check_not_identical(list(zip(want, got, cpu))) and ok
@@ -145,6 +150,14 @@ def main():
           f"max_abs={maxabs:.3e} (ref range {rng:.3f})")
     print(f"[test] task agreement: AbsRel={absrel:.5f} delta-1={d1:.5f}")
     if dcos < DEPTH_COS:
+        ok = False
+
+    # Only the output lane-0 rounding that moves with the NPU core a job lands on may differ.
+    rcos = cos_of(again[0], got[0])
+    rmax = float(np.max(np.abs(again[0].astype(np.float64) - got[0].astype(np.float64))))
+    print(f"[test] after another image: cos(again,first)={rcos:.9f} max_abs={rmax:.3e} "
+          f"(gate cos>={REUSE_COS})")
+    if rcos < REUSE_COS:
         ok = False
 
     for i, t in enumerate(taps):

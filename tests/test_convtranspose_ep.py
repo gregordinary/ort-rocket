@@ -100,8 +100,11 @@ def log2s(v):
 # ---------------------------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------------------------
-def cpu_run(path, feeds, outs=None):
-    s = ort.InferenceSession(path, providers=[CPU_EP])
+def cpu_run(path, feeds, outs=None, opt=None):
+    so = ort.SessionOptions()
+    if opt is not None:
+        so.graph_optimization_level = opt
+    s = ort.InferenceSession(path, so, providers=[CPU_EP])
     r = s.run(outs, feeds)
     del s
     return r
@@ -321,9 +324,12 @@ def pix2pix(lib, tmp, path):
             print(f"[test] pix2pix e2e ({tag}, {opt.name}): {n_ep} node(s) on the EP, max abs "
                   f"{d.max():.3e}, mean abs {d.mean():.3e}, PSNR {psnr:.1f} dB  {'ok' if ok else 'FAIL'}")
             record(ok, f"pix2pix e2e {tag} {opt.name}")
+    # The reference runs at the EP session's optimization level. From ONNX Runtime 1.31 the CPU
+    # EP's ORT_DISABLE_ALL output differs from ORT_ENABLE_BASIC's and up on this model by up to
+    # 1.9e-6, so a default-level reference fails an EP that claimed nothing.
     os.environ["ROCKET_ORT_CONVTRANSPOSE"] = "0"
     try:
-        cpu = cpu_run(path, {in_name: x_lab})[0]
+        cpu = cpu_run(path, {in_name: x_lab}, opt=ort.GraphOptimizationLevel.ORT_DISABLE_ALL)[0]
         ep, placement = ep_run(lib, path, {in_name: x_lab})
     finally:
         del os.environ["ROCKET_ORT_CONVTRANSPOSE"]
@@ -387,6 +393,10 @@ def sam_decoder(lib, tmp, path, emb_path):
 def main():
     args = sys.argv[1:]
     lib = os.path.abspath(args[0])
+    # This gate is the ConvTranspose handler's: its node counts and its knob-off identity assume no
+    # other per-node claim, so the Conv claim is off unless the caller sets it (test_conv_ep.py
+    # covers the two together).
+    os.environ.setdefault("ROCKET_ORT_CONV", "0")
 
     def opt(flag):
         return os.path.abspath(args[args.index(flag) + 1]) if flag in args else None

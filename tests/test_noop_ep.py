@@ -11,6 +11,7 @@ Proves, end to end, that:
 
 Usage: python test_noop_ep.py <libonnxruntime_rocket.so> <rfdetr.onnx> [golden_dir]
 """
+import gc
 import os
 import sys
 
@@ -41,6 +42,10 @@ def run(onnx_path, session_options, providers=None):
 
 
 def main():
+    # The premise is a session the EP claims nothing in. At this optimization level the family
+    # matcher misses, but the per-node Conv claim would take RF-DETR's patch embedding and projector
+    # convs (faithful at the detection level, not bit-identical), so it is off here.
+    os.environ.setdefault("ROCKET_ORT_CONV", "0")
     ep_lib = os.path.abspath(sys.argv[1])
     onnx_path = os.path.abspath(sys.argv[2])
     golden_dir = sys.argv[3] if len(sys.argv) > 3 else None
@@ -94,6 +99,11 @@ def main():
                 print(f"[test] {n}: matches golden={exact} max_abs_diff={max_abs:.3e}")
                 ok = ok and exact
 
+    # Everything that references the EP goes before the library does. A session, its options or a
+    # device handle still alive at unregister is destroyed later, at interpreter exit, and calls into
+    # the unloaded library.
+    del sess_ep, so, dev, ours, devices
+    gc.collect()
     ort.unregister_execution_provider_library(REG_NAME)
     print("[test] unregistered EP library")
 

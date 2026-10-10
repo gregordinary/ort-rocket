@@ -13,7 +13,8 @@
 // deformable decoder and DETR postproc, the pooling heads, the SAM prompt/mask decoder, the
 // DPT depth head -- is not claimed and falls back to ORT's CPU kernels. The same GetCapability
 // pass also claims each eligible ConvTranspose outside the family claim, in any graph, as a fused
-// node of its own (rocket_convt, the resident transposed convolution).
+// node of its own (rocket_convt, the resident transposed convolution), and each Conv a cost rule
+// says the NPU runs faster (rocket_convf, the resident im2col convolution).
 //
 // Each family's compute is graded bit-faithful to the ORT CPU EP off-device before it claims
 // on device. This file is the ORT plumbing: partition, weight marshaling, and kernel-context
@@ -48,6 +49,7 @@
 #include "rocket_modernbert.h"
 #include "rocket_match.h"
 #include "rocket_convt.h"
+#include "rocket_convf.h"
 
 namespace {
 
@@ -181,13 +183,13 @@ struct RocketEp : OrtEp {
   const OrtApi& ort_api;
   std::string name;
   const OrtLogger& logger;
-  // The resident-matmul context every claimed ConvTranspose packs on, opened at the first
-  // GetCapability that finds a claimable one. ct_open_failed stops a retry per graph.
+  // The resident-matmul context every per-node claim (ConvTranspose, Conv) packs on, opened at the
+  // first GetCapability that finds a claimable node. ct_open_failed stops a retry per graph.
   std::shared_ptr<rocket_convt::Shared> ct_shared;
   bool ct_open_failed = false;
   // The session's session.intra_op.allow_spinning (ONNX Runtime's default is on), read at CreateEp.
-  // Spinning intra-op threads take the cores a claimed ConvTranspose's workers need, so a claim
-  // under it logs one warning.
+  // Spinning intra-op threads take the cores a per-node claim's workers need, so a claim under it
+  // logs one warning.
   bool intra_spin = true;
   bool spin_warned = false;
 
@@ -201,10 +203,10 @@ struct RocketEp : OrtEp {
     return static_cast<const RocketEp*>(p)->name.c_str();
   }
 
-  // Two kinds of claim share one pass. The first family whose signature matches claims its encoder
+  // Three kinds of claim share one pass. The first family whose signature matches claims its encoder
   // subgraph as one fused node; then every ConvTranspose outside that subgraph that the resident
-  // entry can run is claimed as a fused node of its own. Either may be empty; neither depends on the
-  // other.
+  // entry can run, and every Conv outside it that the cost rule admits, is claimed as a fused node of
+  // its own (a Conv with the Relu or LeakyRelu it feeds). Any may be empty; none depends on another.
   static OrtStatus* ORT_API_CALL GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
                                                    OrtEpGraphSupportInfo* support_info) noexcept {
     auto* ep = static_cast<RocketEp*>(this_ptr);
@@ -215,7 +217,40 @@ struct RocketEp : OrtEp {
     if (OrtStatus* st = api.Graph_GetNodes(graph, nodes.data(), num_nodes)) return st;
     std::vector<char> claimed_flag(num_nodes, 0);
     if (OrtStatus* st = ClaimFamily(ep, graph, nodes, &claimed_flag, support_info)) return st;
-    return ClaimConvTranspose(ep, nodes, claimed_flag, support_info);
+    int per_node = 0;
+    if (OrtStatus* st = ClaimConvTranspose(ep, nodes, claimed_flag, support_info, &per_node)) return st;
+    if (OrtStatus* st = ClaimConv(ep, nodes, &claimed_flag, support_info, &per_node)) return st;
+    if (per_node && ep->intra_spin && !ep->spin_warned) {
+      ep->spin_warned = true;
+      ep->Log(ORT_LOGGING_LEVEL_WARNING,
+              "ort-rocket: session.intra_op.allow_spinning is on, so ONNX Runtime's idle intra-op "
+              "threads spin while each per-node claim (ConvTranspose, Conv) runs and take the cores "
+              "its NPU workers and host passes need. Set session.intra_op.allow_spinning=0 for this "
+              "session.");
+    }
+    return nullptr;
+  }
+
+  // The shared per-node context, opened on first use. Empty *why when it is open.
+  static void OpenNodeShared(RocketEp* ep, const char* what, std::string* why) {
+    why->clear();
+    if (ep->ct_shared) return;
+    if (ep->ct_open_failed) { *why = "device did not open"; return; }
+    int nthreads = 3;
+    if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
+    std::string err;
+    ep->ct_shared = rocket_convt::OpenShared(nthreads, &err);
+    if (!ep->ct_shared) {
+      ep->ct_open_failed = true;
+      ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: " + err + "; " + what + " stays on the CPU");
+      *why = "device did not open";
+    }
+  }
+
+  static void CountRefusal(std::vector<std::pair<std::string, int>>* refused, const std::string& why) {
+    for (auto& r : *refused)
+      if (r.first == why) { r.second++; return; }
+    refused->emplace_back(why, 1);
   }
 
   // Claim the DINOv2 encoder subgraph (the ancestor set of the 4 feature tensors) as one
@@ -344,7 +379,7 @@ struct RocketEp : OrtEp {
   // the session log.
   static OrtStatus* ClaimConvTranspose(RocketEp* ep, const std::vector<const OrtNode*>& nodes,
                                        const std::vector<char>& claimed_flag,
-                                       OrtEpGraphSupportInfo* support_info) {
+                                       OrtEpGraphSupportInfo* support_info, int* per_node) {
     const OrtApi& api = ep->ort_api;
     const OrtEpApi& ep_api = *api.GetEpApi();
     std::vector<std::pair<std::string, int>> refused;
@@ -359,26 +394,9 @@ struct RocketEp : OrtEp {
         rocket_convt::Spec spec;
         if (OrtStatus* st = rocket_convt::Check(api, nodes[i], &spec, &why)) return st;
       }
-      if (why.empty() && !ep->ct_shared) {
-        if (ep->ct_open_failed) {
-          why = "device did not open";
-        } else {
-          int nthreads = 3;
-          if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
-          std::string err;
-          ep->ct_shared = rocket_convt::OpenShared(nthreads, &err);
-          if (!ep->ct_shared) {
-            ep->ct_open_failed = true;
-            ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: " + err + "; ConvTranspose stays on the CPU");
-            why = "device did not open";
-          }
-        }
-      }
+      if (why.empty()) OpenNodeShared(ep, "ConvTranspose", &why);
       if (!why.empty()) {
-        bool counted = false;
-        for (auto& r : refused)
-          if (r.first == why) { r.second++; counted = true; break; }
-        if (!counted) refused.emplace_back(why, 1);
+        CountRefusal(&refused, why);
         continue;
       }
       OrtNodeFusionOptions opts{};
@@ -388,16 +406,76 @@ struct RocketEp : OrtEp {
         return st;
       claimed++;
     }
-    if (claimed && ep->intra_spin && !ep->spin_warned) {
-      ep->spin_warned = true;
-      ep->Log(ORT_LOGGING_LEVEL_WARNING,
-              "ort-rocket: session.intra_op.allow_spinning is on, so ONNX Runtime's idle intra-op "
-              "threads spin while each claimed ConvTranspose runs and take the cores its NPU workers "
-              "and scatter-add need. Set session.intra_op.allow_spinning=0 for this session.");
-    }
+    *per_node += claimed;
     if (seen) {
       std::string msg = "ort-rocket: claiming " + std::to_string(claimed) + " of " + std::to_string(seen) +
                         " ConvTranspose node(s) outside the encoder claim";
+      if (!refused.empty()) {
+        msg += "; left on the CPU:";
+        for (size_t r = 0; r < refused.size(); r++)
+          msg += (r ? ", " : " ") + std::to_string(refused[r].second) + " " + refused[r].first;
+      }
+      ep->Log(ORT_LOGGING_LEVEL_INFO, msg);
+    }
+    return nullptr;
+  }
+
+  // Claim each Conv outside the family claim that the resident im2col entry can run and the cost rule
+  // admits, one fused node per Conv, with the Relu or LeakyRelu that is its only consumer folded in.
+  // The refusals are counted by reason and logged as one line.
+  static OrtStatus* ClaimConv(RocketEp* ep, const std::vector<const OrtNode*>& nodes,
+                              std::vector<char>* claimed_flag, OrtEpGraphSupportInfo* support_info,
+                              int* per_node) {
+    const OrtApi& api = ep->ort_api;
+    const OrtEpApi& ep_api = *api.GetEpApi();
+    const rocket_convf::Mode mode = rocket_convf::GetMode();
+    std::unordered_map<const OrtNode*, size_t> index;
+    for (size_t i = 0; i < nodes.size(); i++) index.emplace(nodes[i], i);
+    std::vector<std::pair<std::string, int>> refused;
+    int claimed = 0, folded = 0, seen = 0;
+    for (size_t i = 0; i < nodes.size(); i++) {
+      if ((*claimed_flag)[i] || NodeOpType(api, nodes[i]) != "Conv") continue;
+      seen++;
+      std::string why, note;
+      rocket_convf::Spec spec;
+      if (mode == rocket_convf::Mode::kOff) {
+        why = "ROCKET_ORT_CONV=0";
+      } else {
+        if (OrtStatus* st = rocket_convf::Check(api, nodes[i], &spec, &why)) return st;
+      }
+      const OrtNode* act = nullptr;
+      if (why.empty()) {
+        if (OrtStatus* st = rocket_convf::FoldableActivation(api, nodes[i], &spec, &act)) return st;
+        if (act) {
+          auto it = index.find(act);
+          if (it == index.end() || (*claimed_flag)[it->second]) {
+            act = nullptr;
+            spec.act = rocket_convf::Act::kNone;
+          }
+        }
+      }
+      if (why.empty() && mode == rocket_convf::Mode::kCost && !rocket_convf::CostRule(spec, &note))
+        why = "cost rule: the CPU kernel is estimated faster";
+      if (why.empty()) OpenNodeShared(ep, "Conv", &why);
+      if (!why.empty()) {
+        CountRefusal(&refused, why);
+        continue;
+      }
+      OrtNodeFusionOptions opts{};
+      opts.ort_version_supported = ORT_API_VERSION;
+      opts.drop_constant_initializers = true;   // Compile keeps its own copy of the weight
+      const OrtNode* fuse[2] = {nodes[i], act};
+      if (OrtStatus* st = ep_api.EpGraphSupportInfo_AddNodesToFuse(support_info, fuse, act ? 2 : 1, &opts))
+        return st;
+      (*claimed_flag)[i] = 1;
+      if (act) { (*claimed_flag)[index[act]] = 1; folded++; }
+      claimed++;
+    }
+    *per_node += claimed;
+    if (seen) {
+      std::string msg = "ort-rocket: claiming " + std::to_string(claimed) + " of " + std::to_string(seen) +
+                        " Conv node(s) outside the encoder claim (" + std::to_string(folded) +
+                        " with their activation)";
       if (!refused.empty()) {
         msg += "; left on the CPU:";
         for (size_t r = 0; r < refused.size(); r++)
@@ -2750,7 +2828,8 @@ static OrtStatus* CompileFamily(RocketEp* ep, const OrtGraph* graph, const OrtNo
 }
 
 // ONNX Runtime hands every fused node of the session to one Compile call: at most one encoder
-// subgraph, and one single-node graph per claimed ConvTranspose.
+// subgraph, one single-node graph per claimed ConvTranspose, and one graph per claimed Conv (the Conv
+// and its folded activation).
 OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** graphs,
                                               const OrtNode** fused_nodes, size_t count,
                                               OrtNodeComputeInfo** node_compute_infos,
@@ -2763,6 +2842,9 @@ OrtStatus* ORT_API_CALL RocketEp::CompileImpl(OrtEp* this_ptr, const OrtGraph** 
     OrtStatus* st = nullptr;
     if (rocket_convt::IsConvTGraph(api, graphs[i])) {
       st = rocket_convt::Compile(api, ep->logger, ep->ct_shared, graphs[i], fused_nodes[i],
+                                 &node_compute_infos[i]);
+    } else if (rocket_convf::IsConvGraph(api, graphs[i])) {
+      st = rocket_convf::Compile(api, ep->logger, ep->ct_shared, graphs[i], fused_nodes[i],
                                  &node_compute_infos[i]);
     } else if (++n_family > 1) {
       st = api.CreateStatus(ORT_INVALID_ARGUMENT,
@@ -2785,7 +2867,7 @@ void ORT_API_CALL RocketEp::ReleaseNodeComputeInfosImpl(OrtEp* /*this_ptr*/,
                                                         OrtNodeComputeInfo** infos,
                                                         size_t count) noexcept {
   for (size_t i = 0; i < count; i++)
-    delete static_cast<rocket_convt::ComputeInfoBase*>(infos[i]);   // an encoder's or a ConvTranspose's
+    delete static_cast<rocket_convt::ComputeInfoBase*>(infos[i]);   // an encoder's or a per-node claim's
 }
 
 // ---------------------------------------------------------------------------

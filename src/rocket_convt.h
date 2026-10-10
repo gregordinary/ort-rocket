@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "onnxruntime_c_api.h"
 
@@ -76,6 +77,12 @@ OrtStatus* Check(const OrtApi& api, const OrtNode* node, Spec* spec, std::string
 // True when a fused subgraph is one ConvTranspose node, which is how Compile tells a ConvTranspose
 // claim from the family claim.
 bool IsConvTGraph(const OrtApi& api, const OrtGraph* graph);
+
+// ROCKET_ORT_PROF's per-call summary: the first call's time (it carries one-time setup) and the
+// median of the calls after it, which is what a back-to-back benchmark of the entry measures. Both
+// are 0 where there are too few calls.
+double FirstMs(const std::vector<double>& ms);
+double MedianAfterFirstMs(const std::vector<double>& ms);
 
 // Compiles one claimed ConvTranspose: reads its weight and bias, packs the weight on `shared` when
 // the input's spatial size is static, and hands back the node's compute info.
