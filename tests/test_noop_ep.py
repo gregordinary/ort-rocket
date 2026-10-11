@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Plumbing test for the ort-rocket no-op execution provider.
+"""Plumbing test for an ort-rocket session that claims nothing.
 
 Proves, end to end, that:
   1. ONNX Runtime loads the EP shared library (register_execution_provider_library),
   2. the factory registers a device that appears in get_ep_devices(),
   3. a session can select the EP (add_provider_for_devices),
-  4. the EP's GetCapability runs (its WARNING line appears in the ORT log), and
+  4. the EP's GetCapability runs (its INFO line appears in the ORT log), and
   5. because it claims zero nodes, the model runs via CPU fallback with outputs
      BIT-IDENTICAL to a plain CPU-EP run and to the reference golden.
 
@@ -65,11 +65,11 @@ def main():
     print(f"[test] device present: ep_name={dev.ep_name} vendor={dev.ep_vendor}")
 
     # 3+4. Select the EP for a session. Turn ORT logging up so the EP's
-    # GetCapability WARNING line is visible (evidence the EP ran).
+    # GetCapability INFO line is visible (evidence the EP ran).
     so = ort.SessionOptions()
-    so.log_severity_level = 0  # VERBOSE, so our WARNING is shown
+    so.log_severity_level = 0  # VERBOSE, so our INFO line is shown
     so.add_provider_for_devices([dev], {})
-    print("[test] creating session WITH ort-rocket selected (watch for the EP WARNING above/below)...")
+    print("[test] creating session WITH ort-rocket selected (watch for the EP INFO line above/below)...")
     sess_ep = run(onnx_path, so)
     names = [o.name for o in sess_ep.get_outputs()]
     in_name = sess_ep.get_inputs()[0].name

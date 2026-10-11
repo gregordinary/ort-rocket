@@ -63,18 +63,18 @@ matcher / implementation notes are in [API.md](API.md).
 
 ## Performance
 
-A single stream runs 1.02-2.4x faster than ONNX Runtime's own CPU kernels, depending on the
-family. On the RK3588 the matmul is DMA/dispatch-bound rather than MAC-bound, and the Cortex-A76
-is a strong baseline. So the gain is set by how much of a model is projection rather than
-attention. Running one process per stream adds throughput, and the NPU frees the A76 cores a
-CPU-only run would occupy.
+A single stream runs 1.03-2.5x faster than ONNX Runtime's own CPU kernels on a vision model. A
+ModernBERT encoder runs 1.3-3.9x faster, depending on the request. On the RK3588 the matmul is
+DMA/dispatch-bound rather than MAC-bound, and the Cortex-A76 is a strong baseline. So the gain is
+set by how much of a model is projection rather than attention. Running one process per stream adds
+throughput, and the NPU frees the A76 cores a CPU-only run would occupy.
 
 Single-stream figures are warm medians, RK3588 @ 600 MHz, with the CPU governor at
 `performance`, over four passes with the arm order rotated. Both arms run on the four Cortex-A76
 cores (`taskset -c 4-7`) at 4 intra-op threads. The CPU EP runs at `ORT_ENABLE_ALL`, and the EP
 session runs with intra-op spinning off. That is the CPU EP's fastest setting on this SoC, and the
 only one whose time repeats from process to process. Every offloaded encoder is numerically
-faithful to the CPU. [HW sweep, 2026-10-09] Reproduce the single-stream column with
+faithful to the CPU. [HW sweep, 2026-10-10] Reproduce the single-stream column with
 [`tools/bench_ep.py`](tools/bench_ep.py) and the pool column with
 [`tools/bench_pool.py`](tools/bench_pool.py):
 
@@ -84,49 +84,54 @@ sudo -E taskset -c 4-7 python tools/bench_ep.py build/libonnxruntime_rocket.so m
 
 | Model | Encoder offloaded | Single-stream (xCPU) | Pool (xsingle-stream) | Faithfulness vs CPU EP |
 |---|---|---:|---:|---|
-| SigLIP-B/16 | plain ViT, d=768, 196 tok | 2.27-2.40x | n/a | last_hidden cos 0.9999864 |
-| CLIP ViT-B/16 | plain ViT, d=768, 197 tok | 2.21-2.33x | n/a | last_hidden cos 0.9999955 |
-| RF-DETR base | DINOv2 ViT-S, d=384, windowed | 1.44-1.48x | ~1.6x | COCO mAP 0.564 = 0.564 (200-img) |
-| RF-DETR nano | DINOv2 ViT-S, d=384, windowed | 1.49x | ~1.6x | COCO mAP 0.5049 vs 0.5051 (500-img) |
-| SAM ViT-B | ViT-Det, d=768, 4096 tok | 1.02-1.03x | ~1.71x | enc cos 0.9999995, mask-IoU 0.9998 |
-| Depth Anything v2 Small | DINOv2 ViT-S, d=384, global 1370 tok | 1.13-1.16x | n/a | depth cos 0.9999999 |
-| Laya English | ModernBERT-large, d=1024, 48-512 tok | 1.66-3.11x | n/a | answers agree 4/4, max prob diff 5.1e-4 |
-| Laya typed decisions | ModernBERT-large, d=1024, 58-639 tok | 1.87-3.03x | n/a | answers agree 3/3, max prob diff 3.3e-4 |
-| Laya multilingual | mmBERT-base, d=768, 56-726 tok | 1.12-2.46x | n/a | answers agree 6/6, max prob diff 3.3e-4 |
+| SigLIP-B/16 | plain ViT, d=768, 196 tok | 2.44-2.52x | n/a | last_hidden cos 0.9999864 |
+| CLIP ViT-B/16 | plain ViT, d=768, 197 tok | 2.39-2.48x | n/a | last_hidden cos 0.9999955 |
+| RF-DETR base | DINOv2 ViT-S, d=384, windowed | 1.61-1.65x | ~1.6x | COCO mAP 0.564 = 0.564 (200-img) |
+| RF-DETR nano | DINOv2 ViT-S, d=384, windowed | 1.57-1.59x | ~1.6x | COCO mAP 0.5049 vs 0.5051 (500-img) |
+| SAM ViT-B | ViT-Det, d=768, 4096 tok | 1.03-1.05x | ~1.71x | enc cos 0.9999995, mask-IoU 0.9998 |
+| Depth Anything v2 Small | DINOv2 ViT-S, d=384, global 1370 tok | 1.33-1.35x | n/a | depth cos 0.9999999 |
+| Laya English | ModernBERT-large, d=1024, 48-512 tok | 1.99-3.95x | n/a | answers agree 4/4, max prob diff 5.1e-4 |
+| Laya typed decisions | ModernBERT-large, d=1024, 58-639 tok | 2.24-3.77x | n/a | answers agree 3/3, max prob diff 3.3e-4 |
+| Laya multilingual | mmBERT-base, d=768, 56-726 tok | 1.32-2.80x | n/a | answers agree 6/6, max prob diff 3.3e-4 |
 
-The Laya rows are against the CPU EP at ONNX Runtime's default thread count, with the EP session
-at its default spinning. With spinning left on, the vision families run up to 1.15x slower on the
-EP. SigLIP then reads 2.07-2.09x and RF-DETR nano 1.36-1.39x, while CLIP and SAM do not move.
-Against an explicit 8-thread CPU EP the ratios read higher and change from process to process.
-Eight threads span both CPU clusters, and the CPU EP's time then falls into per-process modes up
-to 1.75x apart.
+The Laya rows are against the CPU EP at ONNX Runtime's default thread count, over two rotated
+passes [HW sweep, 2026-10-10]. Their EP session runs at its default spinning.
+
+With spinning left on, the vision families run up to 1.19x slower on the EP. SigLIP then reads
+2.12-2.14x, Depth Anything 1.19-1.24x and RF-DETR nano 1.43-1.46x. CLIP, RF-DETR base and SAM move
+by 2% or less. Against an explicit 8-thread CPU EP the ratios read higher and change from process
+to process. Eight threads span both CPU clusters, and the CPU EP's time then falls into
+per-process modes up to 1.75x apart.
 
 **Which models win follows their attention shape.** The NPU runs the projection GEMMs, the
-large-K matmuls, about 2.7x more efficiently per-MAC than attention. Attention's score matmul
-contracts over the head dimension (64) and materializes an `ntok x ntok` score matrix per head.
-So a model's single-stream ratio tracks its *effective* attention-to-projection ratio, `ntok / 4d`.
-It is averaged over the layers, counting a windowed layer at its window length and a global
-layer at the full sequence:
+large-K matmuls, more efficiently per MAC than attention. Attention's score matmul contracts over
+only the head dimension (64), and each head's `ntok x ntok` score matrix crosses to the host for
+its softmax.
+So a model's single-stream ratio falls with its *effective* attention-to-projection ratio,
+`ntok / 4d`. It is averaged over the layers, counting a windowed layer at its window length and a
+global layer at the full sequence:
 
 | Model | ntok | d | effective ntok/4d | attention | single-stream |
 |---|---:|---:|---:|---|---:|
-| SigLIP / CLIP B/16 | ~196 | 768 | 0.06 | global, short | 2.21-2.40x |
-| RF-DETR nano | 580 | 384 | 0.17 | windowed 145, 3 of 12 layers global | 1.49x |
-| RF-DETR base | 1616 | 384 | 0.33 | windowed 101, 3 of 11 layers global | 1.44-1.48x |
-| SAM ViT-B | 4096 | 768 | 0.49 | windowed 196, 4 of 12 layers global | 1.02-1.03x |
-| Depth Anything v2 Small | 1370 | 384 | 0.89 | global 1370 | 1.13-1.16x |
+| SigLIP / CLIP B/16 | ~196 | 768 | 0.06 | global, short | 2.39-2.52x |
+| RF-DETR nano | 580 | 384 | 0.17 | windowed 145, 3 of 12 layers global | 1.57-1.59x |
+| RF-DETR base | 1616 | 384 | 0.33 | windowed 101, 3 of 11 layers global | 1.61-1.65x |
+| SAM ViT-B | 4096 | 768 | 0.49 | windowed 196, 4 of 12 layers global | 1.03-1.05x |
+| Depth Anything v2 Small | 1370 | 384 | 0.89 | global 1370 | 1.33-1.35x |
 
-Short-sequence wide encoders (CLIP, SigLIP) gain most, and the ratio falls as attention takes a
-larger share. SAM is the exception, reading below Depth Anything. Its four global layers each
-attend over 4096 tokens, at 16.8 million scores per head, the largest single attention in the
-set. That is the likely cause, inferred and not isolated. Widening the encoder helps (d=768 beats
-d=384) by raising the projection share, but it cannot shrink an attention cost that only sequence
-length controls.
+Short-sequence wide encoders (CLIP, SigLIP) gain most, and the attention-heavy models least. The
+screen is coarse, and two pairs break its order. RF-DETR base reads slightly above nano, so it
+does not separate models whose ratios sit that close.
+
+SAM reads below Depth Anything. Its four global layers each attend over 4096 tokens, at 16.8
+million scores per head, the largest single attention in the set. That is the likely cause,
+inferred and not isolated. Widening the encoder helps (d=768 beats d=384) by raising the
+projection share, but it cannot shrink an attention cost that only sequence length controls.
 
 The screen prices the NPU's side and holds the CPU's per-MAC rate fixed. That holds across the
 vision families and not for the text one. ONNX Runtime's CPU kernels run the Laya graph, a d=1024
-encoder with masked fp32 attention, at ~77 GOP/s. So Laya reads 3.03x at an `ntok/4d` of 0.16,
-where RF-DETR nano reads 1.49x. The low end of each Laya range is its shortest request, where
+encoder with masked fp32 attention, at ~77 GOP/s. So Laya reads 3.56-3.77x at an `ntok/4d` of 0.16,
+where RF-DETR nano reads 1.57-1.59x. The low end of each Laya range is its shortest request, where
 the NPU's per-call dispatch dominates.
 
 **Throughput.** A single encode is partly host-bound, in score readback, softmax, layout and the
@@ -135,7 +140,8 @@ CPU tail. So running one process per stream adds throughput, and P=4 peaks the 3
 The best host-core placement is model-dependent. RF-DETR scales best with the host threads left
 unpinned (`ROCKET_ORT_PIN=0`), and SAM with a per-process `ROCKET_CPU_AFFINITY` spread across
 distinct A76 cores. The NPU pool scales ~1.6x on RF-DETR and ~1.71x on SAM over a single NPU
-stream. It also frees the A76 cores a CPU-only run would saturate.
+stream. It also frees the A76 cores a CPU-only run would saturate. The pool figures date from
+July 2026, on a build whose single stream was slower, and are not re-measured.
 
 The CPU pools too, so the NPU-vs-CPU number measured against the CPU's *own* best pool is
 narrower. SAM is 1.44x there, and RF-DETR's margin is thinner, because the CPU pools well on
@@ -144,32 +150,27 @@ that workload. Reproduce the vs-CPU-pool ratio with
 have a ~100% offload share, so no host tail dilutes the encoder's edge.
 
 **ConvTranspose** layers gain in proportion to their share of the model. Inside the model the EP
-runs each in 0.2-0.9x the CPU kernel's 4-thread time. A layer with almost no input is the
-exception, such as pix2pix's first, at 1.6x. Each output is within 2^-10.4 of its magnitude sum.
-The figures are against the CPU EP at `ORT_ENABLE_ALL` with the same intra-op thread count, warm
-medians over four to six rotated passes. [HW sweep]
+ran each in 0.2-0.9x the CPU kernel's 4-thread time on a 2026-09-27 build. A layer with almost no
+input is the exception, such as pix2pix's first, at 1.6x. Each output is within 2^-10.4 of its
+magnitude sum. The table is against the CPU EP at `ORT_ENABLE_ALL` with the same intra-op thread
+count. Each figure is a warm median over four to six rotated passes, with the CPU governor at
+`performance` [HW sweep, 2026-10-10].
 
 | Model | ConvTranspose share | 4 threads | 2 threads | Faithfulness vs CPU EP |
 |---|---:|---:|---:|---|
-| pix2pix facades generator | 65% | 1.76x | 2.15x | image max abs 3.7e-3, PSNR 80.8 dB |
-| SAM ViT-B mask decoder, 1 point | 18% | 1.05x | 1.10x (spinning on) | mask IoU >= 0.9975 |
-| SAM ViT-B mask decoder, 64 points | 22% | 1.10x | 1.15x | worst of 192 masks IoU 0.9931 |
+| pix2pix facades generator | 65% | 1.83x | 2.23x | image max abs 3.7e-3, PSNR 80.8 dB |
+| SAM ViT-B mask decoder, 1 point | 18% | 1.07x | 1.13x (spinning on) | mask IoU >= 0.9975 |
+| SAM ViT-B mask decoder, 64 points | 22% | 1.12x | 1.15x | worst of 192 masks IoU 0.9931 |
 
 Those figures run the EP session with `session.intra_op.allow_spinning` set to `0`. With ONNX
 Runtime's default, its idle threads spin through each offloaded node, and pix2pix at 4 threads
-drops to 1.46x.
+dropped to 1.46x on the 2026-09-27 build.
 
 **Conv** layers are claimed where the cost rule admits them. With both per-node claims, pix2pix at
-4 threads runs in 52.6 ms against the CPU EP's 146.6, 2.79x. The ConvTranspose claim alone measures
-1.89x in the same run, with the CPU governor at `performance`, and the pair is 2.75x on `ondemand`.
-The image stays
-within 3.9e-3 of the CPU EP's, at a PSNR of 77.3 dB. On Depth Anything v2-small the rule claims 10 of
-30 head convs, and the wall is 0.970-0.989x the claim off. [HW sweep]
-
-The remaining lever is a tiled, fused global-attention pass, an FA-2-style running softmax that
-keeps the `ntok x ntok` scores off the host DMA path. It would lift both the single-stream number
-and the pool ceiling for the attention-bound models (SAM's four global layers, Depth Anything's
-every layer). It is the obvious next contribution.
+4 threads runs in 50.5 ms against the CPU EP's 146.8, 2.91x. The ConvTranspose claim alone measures
+1.86x in the same run, with the CPU governor at `performance`, and the pair is 2.70x on `ondemand`.
+The image stays within 3.9e-3 of the CPU EP's, at a PSNR of 77.3 dB. On Depth Anything v2-small the
+rule claims 10 of 30 head convs, and the wall is 0.94-0.97x the claim off [HW sweep, 2026-10-10].
 
 ## What runs on the NPU
 
@@ -215,9 +216,9 @@ format. By default it dequantizes the weights to fp16 and runs the same fp16 dat
 faithful and the fast path on this stack.
 
 A native W8A8 int8 datapath (`ROCKET_ORT_INT8=1`) runs the encoder GEMMs as int8 x int8, and is
-~1.8x slower. The stack implements no on-chip int32 accumulation, so every int8 matmul reads its
-int32 result back to the host. It is a faithfulness and experimentation mode rather than a speed
-lever. Detail and the accuracy numbers are in [API.md](API.md#quantized-models).
+~1.7x slower. Each of its matmuls returns int32 results to the host, which requantizes them. It is
+an experimentation mode rather than a speed lever. Detail and the accuracy numbers are in
+[API.md](API.md#quantized-models).
 
 ## Architecture
 
@@ -291,7 +292,7 @@ runs on the CPU.
 
 Turn off intra-op spinning in a session that uses the EP. Otherwise ONNX Runtime's idle threads
 take the cores the offloaded work needs, which slows four of the six families and the per-node
-claims:
+claims. The EP logs one warning when it claims work in a session that spins:
 
 ```python
 so.add_session_config_entry("session.intra_op.allow_spinning", "0")
@@ -308,17 +309,21 @@ model-dependent: RF-DETR unpinned via `ROCKET_ORT_PIN=0`, and SAM a per-process
 
 ## The rocket NPU stack
 
-This provider is one frontend of an open source stack for Rockchip NPUs, three userspace
-projects plus a set of optional kernel patches:
+This provider is one frontend of an open source stack for Rockchip NPUs. The stack is a driver
+library, three frontends, a submit provider for the vendor kernel, and a set of optional kernel
+patches:
 
 - **[`rocket-userspace`](https://github.com/gregordinary/rocket-userspace)** (`librocketnpu`):
   the userspace driver, matmul, and on-NPU op library. It is the dependency, and usable on its
   own.
-- **ort-rocket** (this project): an ONNX Runtime execution provider for transformer vision models.
+- **ort-rocket** (this project): an ONNX Runtime execution provider for transformer encoders and
+  per-layer convolutions.
 - **[`ggml-rocket`](https://github.com/gregordinary/ggml-rocket)**: a ggml backend `.so` for
   `llama.cpp` / `whisper.cpp`, linking the same driver.
 - **[`tflite-rocket`](https://github.com/gregordinary/tflite-rocket)**: a TFLite external delegate
   for detection models, linking the same driver.
+- **[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit)**: a submit provider that runs
+  `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree
   kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock from its 200 MHz
   boot default to 600 MHz, and the figures here assume them.

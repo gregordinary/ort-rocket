@@ -188,8 +188,8 @@ struct RocketEp : OrtEp {
   std::shared_ptr<rocket_convt::Shared> ct_shared;
   bool ct_open_failed = false;
   // The session's session.intra_op.allow_spinning (ONNX Runtime's default is on), read at CreateEp.
-  // Spinning intra-op threads take the cores a per-node claim's workers need, so a claim under it
-  // logs one warning.
+  // Spinning intra-op threads take the cores a claimed node's workers need, so a family or per-node
+  // claim under it logs one warning.
   bool intra_spin = true;
   bool spin_warned = false;
 
@@ -217,16 +217,18 @@ struct RocketEp : OrtEp {
     if (OrtStatus* st = api.Graph_GetNodes(graph, nodes.data(), num_nodes)) return st;
     std::vector<char> claimed_flag(num_nodes, 0);
     if (OrtStatus* st = ClaimFamily(ep, graph, nodes, &claimed_flag, support_info)) return st;
+    bool family = false;
+    for (char f : claimed_flag) family |= f != 0;
     int per_node = 0;
     if (OrtStatus* st = ClaimConvTranspose(ep, nodes, claimed_flag, support_info, &per_node)) return st;
     if (OrtStatus* st = ClaimConv(ep, nodes, &claimed_flag, support_info, &per_node)) return st;
-    if (per_node && ep->intra_spin && !ep->spin_warned) {
+    if ((family || per_node) && ep->intra_spin && !ep->spin_warned) {
       ep->spin_warned = true;
       ep->Log(ORT_LOGGING_LEVEL_WARNING,
               "ort-rocket: session.intra_op.allow_spinning is on, so ONNX Runtime's idle intra-op "
-              "threads spin while each per-node claim (ConvTranspose, Conv) runs and take the cores "
-              "its NPU workers and host passes need. Set session.intra_op.allow_spinning=0 for this "
-              "session.");
+              "threads spin while each claimed node (an encoder, a ConvTranspose, a Conv) runs and "
+              "take the cores its NPU workers and host passes need. Set "
+              "session.intra_op.allow_spinning=0 for this session.");
     }
     return nullptr;
   }
