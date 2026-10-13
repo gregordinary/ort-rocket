@@ -28,7 +28,7 @@ runtime, so the offloaded share is ~90%.
 COCO mAP@[.5:.95] is at parity with the CPU EP. Nano scores 0.5049 against 0.5051 on a 500-image
 slice, and base 0.564 against 0.564 on a 200-image slice.
 
-Single-stream is 1.57-1.59x for nano and 1.61-1.65x for base. The process pool ran ~1.6x over a
+Single-stream is 1.65-1.70x for nano and 1.77-1.79x for base. The process pool ran ~1.6x over a
 single stream in July 2026, on an earlier build. Its edge over the CPU's own best pool is thinner,
 in the envelope below. Detections
 match a CPU run within fp16 tolerance: classes identical, score <= 1.2e-3, box <= 1.7e-4.
@@ -43,7 +43,7 @@ and quick-GELU are all resolved from the graph and handled encoder-side.
 `last_hidden_state` cosine is SigLIP 0.9999864 and CLIP 0.9999955, with CLIP `pooler_output` at
 0.9999712.
 
-Single-stream is 2.44-2.52x for SigLIP and 2.39-2.48x for CLIP, the best of the vision models. The
+Single-stream is 2.64-2.67x for SigLIP and 2.58-2.64x for CLIP, the best of the vision models. The
 ~100% offload share and short 196/197-token sequence put the work in the projections, not
 attention. An odd token count (CLIP's 197) is padded to a multiple of 4 with zero rows.
 
@@ -58,7 +58,7 @@ a Toeplitz gather and computed on-chip in fp16. It is validated at cos >= 0.9999
 against fp32.
 
 Encoder cos is 0.9999995, and mask-IoU 0.9998 over six point prompts against the CPU EP.
-Single-stream is 1.03-1.05x. The process pool read 1.44x best-over-best, or 1.71x over its own
+Single-stream is 1.03-1.04x. The process pool read 1.44x best-over-best, or 1.71x over its own
 single stream, in July 2026 on an earlier build. The four global layers materialize the full 4096 x
 4096 score matrix per head, the likely cause of the near-parity (inferred, not isolated).
 
@@ -73,10 +73,10 @@ resize needs a lattice the NPU's fixed-stride resize cannot express, and the oth
 low-intensity at high resolution.
 
 Depth-map cos 0.9999999, AbsRel 0.00057, delta-1 1.00000, and per-tap cos >= 0.9999969.
-Single-stream is 1.33-1.35x.
+Single-stream is 1.58-1.61x.
 
 Depth Anything's attention is both global and long, at 1370 tokens every layer, the largest
-effective `ntok/4d` in the set at 0.89. Attention costs the most per MAC, mostly in host passes
+effective `ntok/4d` in the set at 0.89. Attention costs the most per MAC, mostly in the host softmax
 over the score matrix, so the model gains less than the projection-heavy families.
 
 The Base variant (d=768) is matcher-supported. Its wider projections raise the projection share,
@@ -104,18 +104,18 @@ stream stays fp32 on the host, because ModernBERT-large's reaches 29000, where f
 Single-stream against the CPU EP at `ORT_ENABLE_ALL` with ONNX Runtime's default thread count,
 which ran this graph faster than 8 threads (1343 against 1580 ms on a 3-question request). Warm,
 two rotated passes, a process per arm, CPU governor at `performance`, memory reset before every arm
-[HW sweep 2026-10-10].
+[HW sweep 2026-10-11].
 
 | Checkpoint | Request | CPU EP | ort-rocket | Speedup |
 |---|---|---:|---:|---:|
-| English | 48 tokens | 382-392 ms | 192 ms | 1.99-2.05x |
-| English | 3 questions, 53 tokens | 1234-1250 ms | 351-357 ms | 3.50-3.52x |
-| English | 512 tokens | 4876-4955 ms | 1255-1278 ms | 3.82-3.95x |
-| typed decisions | 58 tokens | 456-461 ms | 202-206 ms | 2.24-2.26x |
-| typed decisions | 639 tokens | 6494-6551 ms | 1723-1839 ms | 3.56-3.77x |
-| multilingual | 58 tokens | 155-157 ms | 117-119 ms | 1.32-1.33x |
-| multilingual | 3 questions, 58 tokens | 406-415 ms | 211-219 ms | 1.90-1.93x |
-| multilingual | 726 tokens | 2557-2599 ms | 914-1230 ms | 2.11-2.80x |
+| English | 48 tokens | 379-381 ms | 187-188 ms | 2.03x |
+| English | 3 questions, 53 tokens | 1234-1244 ms | 346-354 ms | 3.51-3.57x |
+| English | 512 tokens | 4840-5027 ms | 1194-1209 ms | 4.05-4.16x |
+| typed decisions | 58 tokens | 459-460 ms | 200 ms | 2.29x |
+| typed decisions | 639 tokens | 6484-6492 ms | 1552-1585 ms | 4.10-4.18x |
+| multilingual | 58 tokens | 156-160 ms | 117-118 ms | 1.32-1.36x |
+| multilingual | 3 questions, 58 tokens | 408-411 ms | 217-218 ms | 1.87-1.89x |
+| multilingual | 726 tokens | 2559-2568 ms | 990-1017 ms | 2.53-2.59x |
 
 **Exporting.** Laya's own `scripts/export_onnx.py` traces a batch-1 dummy. Under torch 2.9 and
 later, `torch.onnx.export` defaults to the dynamo exporter, which bakes that batch into the head's
@@ -277,7 +277,7 @@ every number above:
    A model's envelope therefore follows its effective `ntok/4d` rather than its width. That ratio
    is attention-to-projection FLOPs, averaged over the layers, counting a windowed layer at its
    window length. The table in the README orders the vision models by it coarsely. RF-DETR base
-   reads slightly above nano, and SAM, whose four global layers attend over 4096 tokens, reads
+   reads above nano, and SAM, whose four global layers attend over 4096 tokens, reads
    lowest.
 
 **Throughput** is where the stack wins, though less than a single number suggests. In July 2026 the NPU
@@ -293,12 +293,13 @@ unpinned (`ROCKET_ORT_PIN=0`), so the OS spreads them across all eight cores. SA
 attention workers instead need a per-process `ROCKET_CPU_AFFINITY` spread across distinct A76
 cores, and its `ROCKET_ORT_AFFINITY_BASE` is inert.
 
-**Attention's time** on the attention-bound models is mostly host work. At Depth Anything's layer
-(1370 tokens, 6 heads of 64), the NPU's two matmuls take about a quarter of each head's attention
-time [HW sweep]. The rest is three host passes over the score matrix. One converts it out of the
-NPU's tile layout, one is the softmax, and one packs the probabilities back for the second matmul. The NPU
-can write and read those two matrices as plain rows, which would remove both layout passes
-[expected]. The library does not carry that form.
+**Attention's time** on the attention-bound models is the NPU's two matmuls and one host pass,
+the softmax over the score matrix. The NPU writes the scores and reads the probabilities back as
+plain rows. Neither matrix passes through the NPU's tile layout on the host. At Depth
+Anything's layer (1370 tokens, 6 heads of 64), the matmuls take about a third of each head's
+attention time and the softmax the rest. Removing the two layout passes took Depth Anything's EP
+time to 0.84-0.86x [HW sweep 2026-10-11, `ondemand`, A76-confined, spinning off]. SigLIP and CLIP
+went to 0.93-0.95x, and RF-DETR to 0.91-0.95x.
 
 ## Quantized models
 

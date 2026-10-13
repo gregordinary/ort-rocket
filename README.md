@@ -63,8 +63,8 @@ matcher / implementation notes are in [API.md](API.md).
 
 ## Performance
 
-A single stream runs 1.03-2.5x faster than ONNX Runtime's own CPU kernels on a vision model. A
-ModernBERT encoder runs 1.3-3.9x faster, depending on the request. On the RK3588 the matmul is
+A single stream runs 1.03-2.7x faster than ONNX Runtime's own CPU kernels on a vision model. A
+ModernBERT encoder runs 1.3-4.2x faster, depending on the request. On the RK3588 the matmul is
 DMA/dispatch-bound rather than MAC-bound, and the Cortex-A76 is a strong baseline. So the gain is
 set by how much of a model is projection rather than attention. Running one process per stream adds
 throughput, and the NPU frees the A76 cores a CPU-only run would occupy.
@@ -74,7 +74,7 @@ Single-stream figures are warm medians, RK3588 @ 600 MHz, with the CPU governor 
 cores (`taskset -c 4-7`) at 4 intra-op threads. The CPU EP runs at `ORT_ENABLE_ALL`, and the EP
 session runs with intra-op spinning off. That is the CPU EP's fastest setting on this SoC, and the
 only one whose time repeats from process to process. Every offloaded encoder is numerically
-faithful to the CPU. [HW sweep, 2026-10-10] Reproduce the single-stream column with
+faithful to the CPU. [HW sweep, 2026-10-11] Reproduce the single-stream column with
 [`tools/bench_ep.py`](tools/bench_ep.py) and the pool column with
 [`tools/bench_pool.py`](tools/bench_pool.py):
 
@@ -84,22 +84,23 @@ sudo -E taskset -c 4-7 python tools/bench_ep.py build/libonnxruntime_rocket.so m
 
 | Model | Encoder offloaded | Single-stream (xCPU) | Pool (xsingle-stream) | Faithfulness vs CPU EP |
 |---|---|---:|---:|---|
-| SigLIP-B/16 | plain ViT, d=768, 196 tok | 2.44-2.52x | n/a | last_hidden cos 0.9999864 |
-| CLIP ViT-B/16 | plain ViT, d=768, 197 tok | 2.39-2.48x | n/a | last_hidden cos 0.9999955 |
-| RF-DETR base | DINOv2 ViT-S, d=384, windowed | 1.61-1.65x | ~1.6x | COCO mAP 0.564 = 0.564 (200-img) |
-| RF-DETR nano | DINOv2 ViT-S, d=384, windowed | 1.57-1.59x | ~1.6x | COCO mAP 0.5049 vs 0.5051 (500-img) |
-| SAM ViT-B | ViT-Det, d=768, 4096 tok | 1.03-1.05x | ~1.71x | enc cos 0.9999995, mask-IoU 0.9998 |
-| Depth Anything v2 Small | DINOv2 ViT-S, d=384, global 1370 tok | 1.33-1.35x | n/a | depth cos 0.9999999 |
-| Laya English | ModernBERT-large, d=1024, 48-512 tok | 1.99-3.95x | n/a | answers agree 4/4, max prob diff 5.1e-4 |
-| Laya typed decisions | ModernBERT-large, d=1024, 58-639 tok | 2.24-3.77x | n/a | answers agree 3/3, max prob diff 3.3e-4 |
-| Laya multilingual | mmBERT-base, d=768, 56-726 tok | 1.32-2.80x | n/a | answers agree 6/6, max prob diff 3.3e-4 |
+| SigLIP-B/16 | plain ViT, d=768, 196 tok | 2.64-2.67x | n/a | last_hidden cos 0.9999864 |
+| CLIP ViT-B/16 | plain ViT, d=768, 197 tok | 2.58-2.64x | n/a | last_hidden cos 0.9999955 |
+| RF-DETR base | DINOv2 ViT-S, d=384, windowed | 1.77-1.79x | ~1.6x | COCO mAP 0.564 = 0.564 (200-img) |
+| RF-DETR nano | DINOv2 ViT-S, d=384, windowed | 1.65-1.70x | ~1.6x | COCO mAP 0.5049 vs 0.5051 (500-img) |
+| SAM ViT-B | ViT-Det, d=768, 4096 tok | 1.03-1.04x | ~1.71x | enc cos 0.9999995, mask-IoU 0.9998 |
+| Depth Anything v2 Small | DINOv2 ViT-S, d=384, global 1370 tok | 1.58-1.61x | n/a | depth cos 0.9999999 |
+| Laya English | ModernBERT-large, d=1024, 48-512 tok | 2.03-4.16x | n/a | answers agree 4/4, max prob diff 5.1e-4 |
+| Laya typed decisions | ModernBERT-large, d=1024, 58-639 tok | 2.29-4.18x | n/a | answers agree 3/3, max prob diff 3.3e-4 |
+| Laya multilingual | mmBERT-base, d=768, 56-726 tok | 1.32-2.59x | n/a | answers agree 6/6, max prob diff 3.3e-4 |
 
 The Laya rows are against the CPU EP at ONNX Runtime's default thread count, over two rotated
-passes [HW sweep, 2026-10-10]. Their EP session runs at its default spinning.
+passes [HW sweep, 2026-10-11]. Their EP session runs at its default spinning.
 
-With spinning left on, the vision families run up to 1.19x slower on the EP. SigLIP then reads
-2.12-2.14x, Depth Anything 1.19-1.24x and RF-DETR nano 1.43-1.46x. CLIP, RF-DETR base and SAM move
-by 2% or less. Against an explicit 8-thread CPU EP the ratios read higher and change from process
+With spinning left on, the vision families run up to 1.18x slower on the EP. SigLIP then reads
+2.24-2.27x, Depth Anything 1.36-1.47x and RF-DETR nano 1.51-1.54x (three passes of four: the
+fourth's CPU arm ran 720-1050 ms where every other ran 345). CLIP and SAM move by 2% or less, and
+RF-DETR base by 3%. Against an explicit 8-thread CPU EP the ratios read higher and change from process
 to process. Eight threads span both CPU clusters, and the CPU EP's time then falls into
 per-process modes up to 1.75x apart.
 
@@ -113,14 +114,14 @@ global layer at the full sequence:
 
 | Model | ntok | d | effective ntok/4d | attention | single-stream |
 |---|---:|---:|---:|---|---:|
-| SigLIP / CLIP B/16 | ~196 | 768 | 0.06 | global, short | 2.39-2.52x |
-| RF-DETR nano | 580 | 384 | 0.17 | windowed 145, 3 of 12 layers global | 1.57-1.59x |
-| RF-DETR base | 1616 | 384 | 0.33 | windowed 101, 3 of 11 layers global | 1.61-1.65x |
-| SAM ViT-B | 4096 | 768 | 0.49 | windowed 196, 4 of 12 layers global | 1.03-1.05x |
-| Depth Anything v2 Small | 1370 | 384 | 0.89 | global 1370 | 1.33-1.35x |
+| SigLIP / CLIP B/16 | ~196 | 768 | 0.06 | global, short | 2.58-2.67x |
+| RF-DETR nano | 580 | 384 | 0.17 | windowed 145, 3 of 12 layers global | 1.65-1.70x |
+| RF-DETR base | 1616 | 384 | 0.33 | windowed 101, 3 of 11 layers global | 1.77-1.79x |
+| SAM ViT-B | 4096 | 768 | 0.49 | windowed 196, 4 of 12 layers global | 1.03-1.04x |
+| Depth Anything v2 Small | 1370 | 384 | 0.89 | global 1370 | 1.58-1.61x |
 
 Short-sequence wide encoders (CLIP, SigLIP) gain most, and the attention-heavy models least. The
-screen is coarse, and two pairs break its order. RF-DETR base reads slightly above nano, so it
+screen is coarse, and two pairs break its order. RF-DETR base reads above nano, so it
 does not separate models whose ratios sit that close.
 
 SAM reads below Depth Anything. Its four global layers each attend over 4096 tokens, at 16.8
@@ -130,8 +131,8 @@ projection share, but it cannot shrink an attention cost that only sequence leng
 
 The screen prices the NPU's side and holds the CPU's per-MAC rate fixed. That holds across the
 vision families and not for the text one. ONNX Runtime's CPU kernels run the Laya graph, a d=1024
-encoder with masked fp32 attention, at ~77 GOP/s. So Laya reads 3.56-3.77x at an `ntok/4d` of 0.16,
-where RF-DETR nano reads 1.57-1.59x. The low end of each Laya range is its shortest request, where
+encoder with masked fp32 attention, at ~77 GOP/s. So Laya reads 4.10-4.18x at an `ntok/4d` of 0.16,
+where RF-DETR nano reads 1.65-1.70x. The low end of each Laya range is its shortest request, where
 the NPU's per-call dispatch dominates.
 
 **Throughput.** A single encode is partly host-bound, in score readback, softmax, layout and the
