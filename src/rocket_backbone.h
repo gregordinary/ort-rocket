@@ -70,12 +70,12 @@ typedef struct {
 // Select the geometry for a patch-conv kernel size (16 -> nano, 14 -> base); NULL if unknown.
 const rocket_backbone_geom *rocket_backbone_geom_select(int patch_size);
 
-// Check the matmul-alignment invariants a geometry must satisfy or the resident/one-shot matmul
-// silently miscomputes: M = ntok and M = np must both be %4 (the prepacked matmul returns garbage
-// at rc=0 for M%4 != 0), and the int8 projection N must be %32. Both shipping variants pass -- this
-// guards a future/mis-derived variant table entry that would otherwise run and return wrong
-// detections with no error. Cheap; call once at Compile. Returns 0 if valid, else a negative code,
-// and sets *why (when non-NULL) to a static reason string.
+// Check the matmul-alignment invariants a geometry must satisfy: M = ntok and M = np must both be %4
+// (the prepacked matmul refuses another height with -1, which would fail every image), the int8
+// projection N must be %32, and the head split and the scratch bounds must hold. Both shipping
+// variants pass -- this guards a future/mis-derived variant table entry, refusing it before any
+// image runs. Cheap; call once when the weights are marshaled. Returns 0 if valid, else a negative
+// code, and sets *why (when non-NULL) to a static reason string.
 int rocket_backbone_geom_check(const rocket_backbone_geom *g, const char **why);
 
 // One encoder layer's fp16 weights, in rocket layout. Projection weights are [out,in];

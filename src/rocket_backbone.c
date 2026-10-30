@@ -52,8 +52,8 @@ const rocket_backbone_geom *rocket_backbone_geom_select(int patch_size) {
 
 int rocket_backbone_geom_check(const rocket_backbone_geom *g, const char **why) {
   if (!g)                { if (why) *why = "null geometry"; return -1; }
-  // M = ntok (encoder GEMMs) and M = np (projector GEMMs) both drive the prepacked matmul, whose
-  // height must be a multiple of 4 -- M%4 != 0 returns garbage at rc=0.
+  // M = ntok (encoder GEMMs) and M = np (projector GEMMs) both drive the prepacked matmul, which
+  // refuses (-1) a height that is not a multiple of 4, so such a geometry would fail every image.
   if (g->ntok % 4 != 0)  { if (why) *why = "ntok is not a multiple of 4 (matmul M%4 constraint)"; return -2; }
   if (g->np   % 4 != 0)  { if (why) *why = "np is not a multiple of 4 (matmul M%4 constraint)";   return -3; }
   // The int8 projection output width N must be %32; the transformer dims must be self-consistent
@@ -501,7 +501,8 @@ int rocket_backbone_run_ctx(rocket_backbone_ctx *c, const _Float16 *img_chw,
   const int D = g->d, DFF = g->dff, D3 = 3 * g->d;   // fused Q|K|V width = 3*d
   const float eps = w->eps;
   int rc = -2;
-  int prof = getenv("ROCKET_ORT_PROF") != NULL;
+  const char *pz = getenv("ROCKET_ORT_PROF");
+  int prof = pz && atoi(pz) != 0;
   double tb[8] = {0}, t0 = 0;
 #define TIC (t0 = bb_now_ms())
 #define TOC(i) do { if (prof) tb[i] += bb_now_ms() - t0; } while (0)

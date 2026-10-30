@@ -10,7 +10,7 @@
 // running there: a 2-D Conv with group 1, fp32 input and output, a static spatial size, a constant
 // fp32 weight and an optional constant fp32 bias, any auto_pad, a descriptor
 // rocket_conv2d_prepacked_plan accepts, and a cost rule that estimates the NPU call plus the fp32
-// conversions at no more than 0.75x ONNX Runtime's 4-thread CPU kernel (see CostRule). Everything else
+// conversions at no more than 0.9x ONNX Runtime's 4-thread CPU kernel (see CostRule). Everything else
 // stays on ONNX Runtime's CPU kernel, including every depthwise and grouped conv.
 //
 // A Relu or LeakyRelu that is the conv's only consumer, and whose input is not a graph output, is
@@ -28,9 +28,9 @@
 
 namespace rocket_convf {
 
-// The handler's switch, ROCKET_ORT_CONV: 0 turns it off, so every Conv runs on the CPU kernel; "all"
-// claims every node the entry can run, skipping the cost rule (for measurement); anything else, or
-// unset, applies the cost rule.
+// The handler's switch, ROCKET_ORT_CONV: 0 or "off" turns it off, so every Conv runs on the CPU
+// kernel; "all" claims every node the entry can run, skipping the cost rule (for measurement);
+// anything else, or unset, applies the cost rule.
 enum class Mode { kOff, kCost, kAll };
 Mode GetMode();
 
@@ -62,7 +62,8 @@ OrtStatus* FoldableActivation(const OrtApi& api, const OrtNode* conv, Spec* spec
                               const OrtNode** act_node);
 
 // The cost rule: true when the NPU call plus the fp32 <-> fp16 conversions is estimated at no more
-// than 0.75x ONNX Runtime's CPU kernel for the same node. *note gets the two estimates.
+// than 0.9x (ROCKET_ORT_CONV_MARGIN) ONNX Runtime's CPU kernel for the same node. *note gets the two
+// estimates.
 bool CostRule(const Spec& s, std::string* note);
 
 // True when a fused subgraph is a claimed Conv (with or without its folded activation), which is how

@@ -248,7 +248,7 @@ struct ConvComputeInfo : rocket_convt::ComputeInfoBase {
 Mode GetMode() {
   const char* e = std::getenv("ROCKET_ORT_CONV");
   if (!e) return Mode::kCost;
-  if (std::strcmp(e, "0") == 0) return Mode::kOff;
+  if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return Mode::kOff;
   if (std::strcmp(e, "all") == 0) return Mode::kAll;
   return Mode::kCost;
 }
@@ -444,9 +444,9 @@ double CpuEstimateMs(const Spec& s) {
 // librocketnpu creates its workers on their own cores; before that, the encoder's caller pin put
 // every worker on one core and the same nodes ran 1.27-1.29x. At 0.9 Depth Anything's wall is
 // 0.976-0.979x the claim off under the performance and the ondemand governor, against 0.990-0.999x
-// at 0.75; pix2pix claims the same seven convs at both [HW, mainline RK1, 600 MHz, five rotated
-// passes, 2026-10-09 UTC]. ROCKET_ORT_CONV_MARGIN overrides it, for measuring the rule against a
-// model.
+// at 0.75; pix2pix claims the same seven convs at both [HW, mainline RK1, the 600 MHz request
+// (~816 MHz), five rotated passes, 2026-10-09 UTC]. ROCKET_ORT_CONV_MARGIN overrides it, for
+// measuring the rule against a model.
 constexpr double kMargin = 0.9;
 
 double Margin() {

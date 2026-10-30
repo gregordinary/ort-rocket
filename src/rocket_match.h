@@ -63,6 +63,10 @@ struct MatchedLayer {
   // role back to the Split output it came from -- never assumed. -1 means "not a split-block
   // family" (SAM feeds its whole [3D,D] weight through and splits it inside the encoder).
   int qkv_blk_q = -1, qkv_blk_k = -1, qkv_blk_v = -1;
+  // The rank-1, length-4 constant shape operand of the Reshape that splits the query into heads
+  // ([1, T, -1, 64] or [1, -1, 6, 64]), which names the head dimension, the head count or both.
+  // Empty when that Reshape takes a computed shape. Set by the plain-ViT and Depth Anything walks.
+  std::string head_shape;
 };
 
 // The backbone family a matcher recognizes. MatchAny tries the registered matchers in order and

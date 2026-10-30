@@ -5,30 +5,37 @@
 // vision-model encoders to Rockchip NPUs via the mainline rocket driver.
 //
 // A matcher registry (rocket_match) recognizes five model families by graph topology --
-// RF-DETR (DINOv2 backbone + CSP projector), CLIP and SigLIP (plain ViT), SAM (ViT-Det),
-// and Depth Anything v2 (DINOv2 backbone + DPT taps). GetCapability claims the first family
-// whose signature matches; Compile marshals that family's initializer weights (projections
-// transposed to rocket [out,in]; fp32 -> fp16; LayerScale folded into Wo/bo,Wf2/bf2 where
-// present); Compute runs the encoder on the NPU. Everything a family does not claim -- the
-// deformable decoder and DETR postproc, the pooling heads, the SAM prompt/mask decoder, the
-// DPT depth head -- is not claimed and falls back to ORT's CPU kernels. The same GetCapability
-// pass also claims each eligible ConvTranspose outside the family claim, in any graph, as a fused
-// node of its own (rocket_convt, the resident transposed convolution), and each Conv a cost rule
-// says the NPU runs faster (rocket_convf, the resident im2col convolution).
+// RF-DETR (DINOv2 backbone + CSP projector), CLIP and SigLIP (one plain-ViT family), SAM
+// (ViT-Det), Depth Anything v2 (DINOv2 backbone + DPT taps) and ModernBERT (text encoder + an
+// optional post stack). GetCapability matches the first family whose signature fits, then builds
+// its whole compiled state: it marshals the initializer weights (projections transposed to rocket
+// [out,in]; fp32 or a QDQ dequantization -> fp16; LayerScale folded into Wo/bo,Wf2/bf2 where
+// present), opens the NPU and packs the resident context. Only then does it claim the encoder as
+// one fused node, so a model the EP cannot run stays on ORT's CPU kernels; a failure in Compile
+// would fail session creation instead, because the EP API cannot return a claimed node to the CPU.
+// Compile maps the fused node's inputs and outputs onto that state. Compute runs the encoder's
+// matmuls, attention's two included, on the NPU, and its normalization, activation, bias, residual
+// and softmax passes on the host. Everything a family does not claim -- the deformable decoder and
+// DETR postproc, the pooling heads, the SAM prompt/mask decoder, the DPT depth head, the text task
+// heads -- falls back to ORT's CPU kernels. The same GetCapability pass also claims each eligible
+// ConvTranspose outside the family claim, in any graph, as a fused node of its own (rocket_convt,
+// the resident transposed convolution), and each Conv a cost rule says the NPU runs faster
+// (rocket_convf, the resident im2col convolution).
 //
-// Each family's compute is graded bit-faithful to the ORT CPU EP off-device before it claims
-// on device. This file is the ORT plumbing: partition, weight marshaling, and kernel-context
-// I/O; the on-NPU datapaths live in rocket_backbone / rocket_projector (RF-DETR) and the
-// librocketnpu SigLIP and SAM encoders (the other families).
+// This file is the ORT plumbing: partition, weight marshaling, and kernel-context I/O; the
+// datapaths live in rocket_backbone / rocket_projector (RF-DETR) and librocketnpu's plain-ViT,
+// SAM and ModernBERT encoders (the other families).
 //
 // Subgraphs and weight-bearing nodes are located by GRAPH TOPOLOGY (rocket_match), not by
 // exporter-generated tensor/node names, so a re-export (torch/opset/version bump) that renames
-// the interior still matches. Per-family geometry (patch size, token/layer counts, width) is
-// read from the graph. The session must run with graph optimization DISABLED -- ORT's
-// Gemm/FusedMatMul/Gelu/SkipLayerNorm fusions rewrite the encoder into a contrib-op topology the
-// matcher (keyed on the raw exported ops) does not model; supporting graph-opt-on is a separate,
-// larger effort.
+// the interior still matches. RF-DETR is the exception: its stem cls token and position table,
+// its feature norm and its projector are read by their state_dict names. Per-family geometry
+// (patch size, token/layer counts, width, head count) is read from the graph. The session must
+// run with graph optimization DISABLED -- ORT's Gemm/FusedMatMul/Gelu/SkipLayerNorm fusions
+// rewrite the encoder into a contrib-op topology the matcher (keyed on the raw exported ops) does
+// not model; supporting graph-opt-on is a separate, larger effort.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -37,11 +44,13 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "onnxruntime_c_api.h"
 
 #include "rocket_npu.h"
+#include "rocket_hw_profile.h"
 #include "rocket_backbone.h"
 #include "rocket_projector.h"
 #include "rocket_sam.h"
@@ -57,9 +66,11 @@ namespace {
 // (if U is on a path between two ancestors of a tensor X, U is itself an ancestor of X), with exactly
 // that tensor out and the image in. It subsumes the whole DINOv2 encoder, the backbone->projector
 // de-window glue (Slice/Reshape/Transpose), and the CSP projector, so one NPU fused node spans
-// backbone + projector with no mid-graph CPU hop. The seed tensor and every weight-bearing node are
-// located by GRAPH TOPOLOGY (rocket_match), not by name, so the claim survives an RF-DETR re-export
-// that renames the interior tensors and the anonymous projection initializers. The session must still
+// backbone + projector with no mid-graph CPU hop. The seed tensor and every encoder projection are
+// located by GRAPH TOPOLOGY (rocket_match), not by name, so a re-export that renames the interior
+// tensors and the anonymous projection initializers still matches. The stem cls/position table, the
+// feature norm and the projector weights are read by their state_dict names (MarshalWeights,
+// MarshalProjector), so an export that renames those is not claimed. The session must still
 // run with graph optimization DISABLED: ORT's Gemm/FusedMatMul/Gelu/SkipLayerNorm rewrites replace
 // this block with a different op topology the matcher (keyed on the raw exported ops) does not model.
 
@@ -68,8 +79,9 @@ inline void DiscardStatus(const OrtApi& api, OrtStatus* status) {
 }
 
 // ---------------------------------------------------------------------------
-// Compiled backbone+projector state: owns the fp16 weights and the rocket fd. Built once
-// in Compile, pointed at by the OrtNodeComputeInfo, freed in ReleaseState.
+// A family claim's compiled state: owns the fp16 weights, the rocket fd and the resident contexts.
+// Built once by GetCapability before it claims (PrepareFamily), handed to the OrtNodeComputeInfo by
+// Compile, and freed with it.
 // ---------------------------------------------------------------------------
 struct CompiledBackbone {
   const OrtApi& api;
@@ -87,8 +99,8 @@ struct CompiledBackbone {
   int8_t*  alloc_i8(size_t n) { i8_codes.emplace_back(n);   return i8_codes.back().data(); }
   float*   alloc_sc(size_t n) { i8_scales.emplace_back(n);  return i8_scales.back().data(); }
   int32_t* alloc_rs(size_t n) { i8_rowsums.emplace_back(n); return i8_rowsums.back().data(); }
-  // Resident (prepacked, multicore) contexts: weights packed into NPU BOs once at Compile
-  // and reused across every image. NULL => the one-shot fallback (ROCKET_ORT_RESIDENT=0, or
+  // Resident (prepacked, multicore) contexts: weights packed into NPU BOs once, when the state is
+  // built, and reused across every image. NULL => the one-shot fallback (ROCKET_ORT_RESIDENT=0, or
   // a ctx-create failure). The ctxs read w/pw's bias/gamma pointers per call, so `owned`
   // must outlive them -- it does (same object).
   rocket_backbone_ctx* bctx = nullptr;
@@ -110,10 +122,11 @@ struct CompiledBackbone {
   // one. tap_out_slot[t] is the ORT output index carrying tap t, resolved at Compile by matching the
   // fused node's output names against the matcher's tap tensors (never positional guesswork).
   bool is_depth = false;
+  std::vector<std::string> tap_names;          // the matcher's tap tensors, which name the outputs
   std::vector<size_t> tap_out_slot;
   // ModernBERT text encoder (Family::ModernBert), with the Laya decision head as its post stack.
   // The fused node reads token ids, the attention mask and the type ids, not an image; the token
-  // and type tables are copied at Compile so Compute gathers from them directly.
+  // and type tables are copied when the state is built, so Compute gathers from them directly.
   bool is_mb = false;
   rocket_modernbert_model mbm{};
   rocket_mb_ctx* mbctx = nullptr;
@@ -123,6 +136,7 @@ struct CompiledBackbone {
   const float* mb_type = nullptr;              // [n_type][d], or null without a post bias
   int64_t mb_ntype = 0;
   static constexpr size_t kNoInput = static_cast<size_t>(-1);
+  std::string mb_ids_name, mb_type_name;       // the graph inputs the token and type gathers read
   size_t mb_ids_idx = kNoInput, mb_mask_idx = kNoInput, mb_type_idx = kNoInput;
   std::vector<float> s_emb, s_pb, s_mbout;
   std::vector<int> s_len;
@@ -167,6 +181,15 @@ struct CompiledBackbone {
   }
 };
 
+// "" when the NPU is an RK3588, else why the EP claims nothing: every claim runs librocketnpu's fp16
+// programs, which are RK3588 encodings and refuse on another profiled part.
+static std::string ChipWhy() {
+  const rocket_hw_profile* hw = rocket_hw_current();
+  if (hw && hw->name && std::strcmp(hw->name, "rk3588") == 0) return std::string();
+  return std::string("the NPU is an ") + (hw && hw->name ? hw->name : "unknown part") +
+         ", and the EP's fp16 programs run on the RK3588 only";
+}
+
 // ---------------------------------------------------------------------------
 // OrtEp instance.
 // ---------------------------------------------------------------------------
@@ -184,18 +207,40 @@ struct RocketEp : OrtEp {
   std::string name;
   const OrtLogger& logger;
   // The resident-matmul context every per-node claim (ConvTranspose, Conv) packs on, opened at the
-  // first GetCapability that finds a claimable node. ct_open_failed stops a retry per graph.
+  // first GetCapability that finds a claimable node. A non-empty ct_open_why is the refusal class of
+  // a failed open, and stops a retry per graph.
   std::shared_ptr<rocket_convt::Shared> ct_shared;
-  bool ct_open_failed = false;
+  std::string ct_open_why;
+  // The family claim's compiled state, built by GetCapability before it claims (see ClaimFamily) and
+  // taken by Compile.
+  std::unique_ptr<CompiledBackbone> family_state;
   // The session's session.intra_op.allow_spinning (ONNX Runtime's default is on), read at CreateEp.
   // Spinning intra-op threads take the cores a claimed node's workers need, so a family or per-node
   // claim under it logs one warning.
   bool intra_spin = true;
   bool spin_warned = false;
+  bool threads_warned = false;
 
   void Log(OrtLoggingLevel lvl, const std::string& msg) const {
     DiscardStatus(ort_api, ort_api.Logger_LogMessage(&logger, lvl, msg.c_str(),
                                                      ORT_FILE, __LINE__, __FUNCTION__));
+  }
+
+  // ROCKET_ORT_THREADS: the NPU workers of every resident context, 3 by default, one per NPU core.
+  // librocketnpu runs at most 8 workers per context, so a larger value runs as 8, and a value
+  // below 1 or not a number takes the default. Either logs one warning.
+  int Threads() {
+    const char* tz = std::getenv("ROCKET_ORT_THREADS");
+    if (!tz) return 3;
+    const int v = std::atoi(tz);
+    if (v >= 1 && v <= 8) return v;
+    const int n = v > 8 ? 8 : 3;
+    if (!threads_warned) {
+      threads_warned = true;
+      Log(ORT_LOGGING_LEVEL_WARNING, std::string("ort-rocket: ROCKET_ORT_THREADS=") + tz +
+                                         " is outside 1-8; running " + std::to_string(n) + " workers");
+    }
+    return n;
   }
 
  private:
@@ -234,18 +279,21 @@ struct RocketEp : OrtEp {
   }
 
   // The shared per-node context, opened on first use. Empty *why when it is open.
-  static void OpenNodeShared(RocketEp* ep, const char* what, std::string* why) {
+  static void OpenNodeShared(RocketEp* ep, std::string* why) {
     why->clear();
     if (ep->ct_shared) return;
-    if (ep->ct_open_failed) { *why = "device did not open"; return; }
-    int nthreads = 3;
-    if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
-    std::string err;
-    ep->ct_shared = rocket_convt::OpenShared(nthreads, &err);
+    if (!ep->ct_open_why.empty()) { *why = ep->ct_open_why; return; }
+    std::string err = ChipWhy();
+    if (err.empty()) {
+      ep->ct_shared = rocket_convt::OpenShared(ep->Threads(), &err);
+      if (!ep->ct_shared) ep->ct_open_why = "device did not open";
+    } else {
+      ep->ct_open_why = "not an RK3588";
+    }
     if (!ep->ct_shared) {
-      ep->ct_open_failed = true;
-      ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: " + err + "; " + what + " stays on the CPU");
-      *why = "device did not open";
+      ep->Log(ORT_LOGGING_LEVEL_WARNING,
+              "ort-rocket: " + err + "; every ConvTranspose and Conv stays on the CPU");
+      *why = ep->ct_open_why;
     }
   }
 
@@ -255,126 +303,12 @@ struct RocketEp : OrtEp {
     refused->emplace_back(why, 1);
   }
 
-  // Claim the DINOv2 encoder subgraph (the ancestor set of the 4 feature tensors) as one
-  // fused node. Convex by construction; the boundary is the image in and the 4 features out.
-  // Marks the claimed nodes in *claimed_flag; claims nothing when no family matches.
+  // Claim the first matching family's encoder as one fused node, once its compiled state is built.
+  // Defined below, after the marshaling it calls.
   static OrtStatus* ClaimFamily(RocketEp* ep, const OrtGraph* graph,
                                 const std::vector<const OrtNode*>& nodes,
                                 std::vector<char>* claimed_flag_out,
-                                OrtEpGraphSupportInfo* support_info) {
-    const OrtApi& api = ep->ort_api;
-    const OrtEpApi& ep_api = *api.GetEpApi();
-
-    // Structural match: locate the encoder+projector by op topology (no name dependency), trying
-    // each registered backbone family in turn (MatchAny). On any miss -- not a recognized graph, or
-    // a graph whose optimizations were left on so the block was fused away -- claim no encoder and
-    // leave it to ORT's CPU kernels.
-    rocket_match::BackboneMatch match = rocket_match::MatchAny(api, graph);
-    if (!match.ok) {
-      ep->Log(ORT_LOGGING_LEVEL_INFO,
-              std::string("ort-rocket: no encoder family matched (") + match.reason +
-                  "). This EP offloads the encoder of RF-DETR, CLIP/SigLIP, SAM, Depth Anything v2 and "
-                  "ModernBERT; run the session with graph_optimization_level=ORT_DISABLE_ALL so the "
-                  "exported op topology survives.");
-      return nullptr;
-    }
-    // Durable: family-specific pre-claim validation, so a partial/unexpected match degrades to
-    // CPU here rather than hard-failing session creation in Compile (the EP API has no way to
-    // un-claim once Compile runs). DINOv2 selects an RF-DETR variant by patch size and requires the
-    // exact encoder-layer count; plain-ViT (SigLIP) claims its encoder directly (the ancestor BFS
-    // below is family-agnostic -- it seeds from match.exit_tensor). Patch 16 collides between the two
-    // families, so this MUST branch on family, not patch size.
-    if (match.family == rocket_match::Family::DinoV2RfDetr) {
-      const rocket_backbone_geom* geom = rocket_backbone_geom_select(match.patch_size);
-      if (!geom || match.layers.size() != static_cast<size_t>(geom->nlayer)) {
-        ep->Log(ORT_LOGGING_LEVEL_WARNING,
-                "ort-rocket: matched a DINOv2-shaped subgraph (patch " + std::to_string(match.patch_size) +
-                    ", " + std::to_string(match.layers.size()) + " encoder layers) that does not fit a "
-                    "known RF-DETR variant; not claiming the encoder.");
-        return nullptr;
-      }
-    }
-    // SAM ViT-Det claims like plain-ViT: the ancestor BFS below is family-agnostic (it seeds from
-    // match.exit_tensor -- the conv-neck output). Compile marshals it into the rocket_sam encoder.
-    const bool is_siglip = match.family == rocket_match::Family::SiglipVit;
-    const bool is_sam = match.family == rocket_match::Family::SamVitDet;
-
-    const size_t num_nodes = nodes.size();
-
-    // producer[tensor name] -> node index; node_inputs[i] -> its input tensor names.
-    std::unordered_map<std::string, size_t> producer;
-    std::vector<std::vector<std::string>> node_inputs(num_nodes);
-    auto value_names = [&](const OrtValueInfo* const* vis, size_t n, std::vector<std::string>* out) -> OrtStatus* {
-      for (size_t k = 0; k < n; k++) {
-        if (!vis[k]) continue;   // omitted optional edge -> null OrtValueInfo* (GetValueInfoName segfaults)
-        const char* nm = nullptr;
-        if (OrtStatus* st = api.GetValueInfoName(vis[k], &nm)) return st;
-        if (nm) out->emplace_back(nm);
-      }
-      return nullptr;
-    };
-    for (size_t i = 0; i < num_nodes; i++) {
-      size_t no = 0, ni = 0;
-      if (OrtStatus* st = api.Node_GetNumOutputs(nodes[i], &no)) return st;
-      std::vector<const OrtValueInfo*> outs(no);
-      if (OrtStatus* st = api.Node_GetOutputs(nodes[i], outs.data(), no)) return st;
-      std::vector<std::string> onames;
-      if (OrtStatus* st = value_names(outs.data(), no, &onames)) return st;
-      for (auto& s : onames) producer.emplace(s, i);
-      if (OrtStatus* st = api.Node_GetNumInputs(nodes[i], &ni)) return st;
-      std::vector<const OrtValueInfo*> ins(ni);
-      if (OrtStatus* st = api.Node_GetInputs(nodes[i], ins.data(), ni)) return st;
-      if (OrtStatus* st = value_names(ins.data(), ni, &node_inputs[i])) return st;
-    }
-
-    // BFS backward from the structurally-found exit tensor(s), collecting all ancestor nodes. A
-    // single-exit family seeds one tensor; a DPT head (DepthAnythingDpt) seeds all of its taps. The
-    // union of ancestor sets is still ancestor-closed, hence still convex, so the multi-seed claim
-    // is as safe a partition as the single-seed one -- it just leaves a fused node with one output
-    // per tap instead of one.
-    std::vector<char>& claimed_flag = *claimed_flag_out;
-    std::vector<std::string> stack;
-    std::unordered_map<std::string, char> visited;
-    if (!match.tap_tensors.empty())
-      for (const std::string& t : match.tap_tensors) stack.emplace_back(t);
-    else
-      stack.emplace_back(match.exit_tensor);
-    while (!stack.empty()) {
-      std::string t = std::move(stack.back());
-      stack.pop_back();
-      if (visited.count(t)) continue;
-      visited.emplace(t, 1);
-      auto it = producer.find(t);
-      if (it == producer.end()) continue;    // initializer or graph input: stop
-      size_t ni = it->second;
-      claimed_flag[ni] = 1;
-      for (const std::string& in : node_inputs[ni])
-        if (!visited.count(in)) stack.push_back(in);
-    }
-
-    std::vector<const OrtNode*> claimed;
-    for (size_t i = 0; i < num_nodes; i++)
-      if (claimed_flag[i]) claimed.push_back(nodes[i]);
-
-    if (claimed.empty()) {   // exit tensor had no producer in this graph -- should not happen post-match
-      ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: matched but claimed no nodes; the encoder stays on the CPU.");
-      return nullptr;
-    }
-    const char* fam_desc =
-        match.family == rocket_match::Family::ModernBert
-            ? "ModernBERT text encoder + post stack, exit the last post layer"
-        : match.family == rocket_match::Family::DepthAnythingDpt
-            ? "Depth Anything v2 DINOv2 encoder, exit the DPT taps (head stays on host)"
-        : is_sam     ? "SAM ViT-Det encoder (windowed + rel-pos), exit neck output"
-        : is_siglip  ? "plain-ViT encoder, exit last_hidden_state"
-                     : "DINOv2 backbone+projector";
-    ep->Log(ORT_LOGGING_LEVEL_INFO,
-            "ort-rocket: claiming " + std::to_string(claimed.size()) + " nodes (" + fam_desc +
-                ", patch " + std::to_string(match.patch_size) + ", " +
-                std::to_string(match.layers.size()) + " layers) as one fused node");
-    return ep_api.EpGraphSupportInfo_AddNodesToFuse(support_info, claimed.data(),
-                                                    claimed.size(), nullptr);
-  }
+                                OrtEpGraphSupportInfo* support_info);
 
   // Claim each ConvTranspose the resident entry can run, one fused node per node, outside the family
   // claim. The refusals are counted by reason and logged as one line, so a model's coverage reads off
@@ -396,7 +330,7 @@ struct RocketEp : OrtEp {
         rocket_convt::Spec spec;
         if (OrtStatus* st = rocket_convt::Check(api, nodes[i], &spec, &why)) return st;
       }
-      if (why.empty()) OpenNodeShared(ep, "ConvTranspose", &why);
+      if (why.empty()) OpenNodeShared(ep, &why);
       if (!why.empty()) {
         CountRefusal(&refused, why);
         continue;
@@ -458,7 +392,7 @@ struct RocketEp : OrtEp {
       }
       if (why.empty() && mode == rocket_convf::Mode::kCost && !rocket_convf::CostRule(spec, &note))
         why = "cost rule: the CPU kernel is estimated faster";
-      if (why.empty()) OpenNodeShared(ep, "Conv", &why);
+      if (why.empty()) OpenNodeShared(ep, &why);
       if (!why.empty()) {
         CountRefusal(&refused, why);
         continue;
@@ -506,7 +440,7 @@ struct RocketEp : OrtEp {
 };
 
 // ---------------------------------------------------------------------------
-// Weight marshaling helpers (Compile time).
+// Weight marshaling helpers (run by GetCapability, before the claim).
 // ---------------------------------------------------------------------------
 struct GraphMaps {
   std::unordered_map<std::string, const OrtValue*> init;    // initializer name -> value
@@ -604,6 +538,57 @@ static OrtStatus* ReadInit(const OrtApi& api, const GraphMaps& m, const std::str
   api.ReleaseTensorTypeAndShapeInfo(info);
   if (st) return st;
   return api.GetTensorData(v, &r->data);
+}
+
+static void LogTo(const OrtApi& api, const OrtLogger* logger, OrtLoggingLevel lvl, const std::string& msg) {
+  if (logger)
+    DiscardStatus(api, api.Logger_LogMessage(logger, lvl, msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+}
+
+// The attention head count of a plain-ViT or Depth Anything encoder of width d. ROCKET_ORT_SIGLIP_HEADS
+// overrides it. Otherwise it is read from the shape operand of the Reshape that splits the query into
+// heads (MatchedLayer::head_shape), which names the head dimension ([1, T, -1, 64]), the head count, or
+// both ([1, -1, 6, 64]). Without that operand the EP takes a head dimension of 64 and logs a warning,
+// since a wrong count computes a plausible wrong output whenever it still divides d.
+static OrtStatus* HeadCount(const OrtApi& api, const GraphMaps& m, const OrtLogger* logger,
+                            const rocket_match::MatchedLayer& ml, int d, const char* family, int* n_head) {
+  int graph_heads = 0;
+  RawInit r;
+  if (!ml.head_shape.empty()) {
+    if (OrtStatus* st = ReadInit(api, m, ml.head_shape, &r)) { api.ReleaseStatus(st); r = RawInit{}; }
+  }
+  if (r.et == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 && r.count == 4) {
+    const int64_t* s = static_cast<const int64_t*>(r.data);
+    const int64_t h = s[2], dh = s[3];   // -1 (inferred) and 0 (copied) name nothing
+    if (h > 0 && dh > 0 && h * dh != d)
+      return api.CreateStatus(ORT_INVALID_GRAPH,
+          (std::string("ort-rocket: ") + family + " attention splits d=" + std::to_string(d) + " into " +
+           std::to_string(h) + " heads of " + std::to_string(dh)).c_str());
+    if (dh > 0 && d % dh == 0) graph_heads = static_cast<int>(d / dh);
+    else if (h > 0 && d % h == 0) graph_heads = static_cast<int>(h);
+  }
+  const char* hz = std::getenv("ROCKET_ORT_SIGLIP_HEADS");
+  const int env = hz ? std::atoi(hz) : 0;
+  if (env > 0) {
+    *n_head = env;
+    if (graph_heads && env != graph_heads)
+      LogTo(api, logger, ORT_LOGGING_LEVEL_WARNING,
+            "ort-rocket: ROCKET_ORT_SIGLIP_HEADS=" + std::to_string(env) + " overrides the " +
+                std::to_string(graph_heads) + " heads the " + family + " attention Reshape names");
+  } else if (graph_heads) {
+    *n_head = graph_heads;
+  } else {
+    *n_head = d / 64;
+    LogTo(api, logger, ORT_LOGGING_LEVEL_WARNING,
+          std::string("ort-rocket: the ") + family + " attention Reshape does not name the head "
+              "dimension, so the EP takes 64 (" + std::to_string(*n_head) + " heads). If the model's "
+              "head dimension is not 64, set ROCKET_ORT_SIGLIP_HEADS to its head count.");
+  }
+  if (*n_head <= 0 || d % *n_head != 0)
+    return api.CreateStatus(ORT_INVALID_GRAPH,
+        (std::string("ort-rocket: ") + family + " head count " + std::to_string(*n_head) +
+         " does not divide d=" + std::to_string(d)).c_str());
+  return nullptr;
 }
 
 // Read a scalar int64 node attribute (e.g. DequantizeLinear 'axis'); returns `def` if absent.
@@ -1295,26 +1280,19 @@ static OrtStatus* MapImageInput(const OrtApi& api, const OrtNode* fused, const G
   return nullptr;
 }
 
-// Compile-time image-input check: validate the fused node's image input against the selected geometry.
-// The pinned datapath assumes a [1, RBB_IC, img, img] fp32 image; the variant is keyed on the
-// patch-conv size (which disambiguates nano/base) but NOT on resolution, so a same-patch export at
-// a different resolution would select the wrong geometry and silently mis-read. Here we reject a
-// concrete dtype/shape mismatch loudly. Symbolic/unknown dims can't be checked at Compile (Compute
-// enforces the element count on every call regardless); *concrete reports whether the [1,IC,img,img]
-// shape was fully pinned, so STRICT can note when it wasn't. Requires image_in_idx (set by
-// MapImageInput).
-static OrtStatus* ValidateImageShape(const OrtApi& api, const OrtNode* fused,
-                                     const CompiledBackbone* cb, bool* concrete) {
+// Image-input check: validate the image input's declared dtype and shape against the selected RF-DETR
+// geometry. The pinned datapath assumes a [1, RBB_IC, img, img] fp32 or fp16 image; the variant is
+// keyed on the patch-conv size (which disambiguates nano/base) but NOT on resolution, so a same-patch
+// export at a different resolution would select the wrong geometry and silently mis-read. Here a
+// concrete dtype/shape mismatch is rejected. Symbolic/unknown dims cannot be checked before a run
+// (Compute enforces the element count on every call regardless); *concrete reports whether the
+// [1,IC,img,img] shape was fully pinned, so STRICT can note when it was not.
+static OrtStatus* ValidateImageShape(const OrtApi& api, const OrtValueInfo* image,
+                                     const rocket_backbone_geom* g, bool* concrete) {
   *concrete = false;
-  const rocket_backbone_geom* g = cb->w.geom;
-  size_t nin = 0;
-  if (OrtStatus* st = api.Node_GetNumInputs(fused, &nin)) return st;
-  if (cb->image_in_idx >= nin)
-    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: image input index out of range");
-  std::vector<const OrtValueInfo*> ins(nin);
-  if (OrtStatus* st = api.Node_GetInputs(fused, ins.data(), nin)) return st;
+  if (!image) return nullptr;
   const OrtTypeInfo* ti = nullptr;                       // graph-owned, not released
-  if (OrtStatus* st = api.GetValueInfoTypeInfo(ins[cb->image_in_idx], &ti)) return st;
+  if (OrtStatus* st = api.GetValueInfoTypeInfo(image, &ti)) return st;
   const OrtTensorTypeAndShapeInfo* tsi = nullptr;        // borrowed from ti, not released
   if (OrtStatus* st = api.CastTypeInfoToTensorInfo(ti, &tsi)) return st;
   if (!tsi) return nullptr;                              // not a tensor type; Compute still checks
@@ -1469,8 +1447,8 @@ static OrtStatus* MarshalWeights(const OrtApi& api, const GraphMaps& m,
 
 // Marshal a plain-ViT (CLIP/SigLIP) encoder into cb->sm, a rocket_siglip_model backed by one
 // contiguous fp16 buffer in `owned`. Geometry is derived from the graph (patch-conv weight shape,
-// fc1 shape, pos-embed rows, matched layer count); n_head defaults to head-dim 64 (ViT-B/L),
-// overridable via ROCKET_ORT_SIGLIP_HEADS. Per-layer weights are laid out in rocket_siglip's exact
+// fc1 shape, pos-embed rows, matched layer count, and the attention Reshape for n_head, see
+// HeadCount). Per-layer weights are laid out in rocket_siglip's exact
 // order/stride; the ONNX MatMul projections ([in,out]) are transposed to rocket [out,in]; there is
 // no LayerScale. The encoder does its own im2col, so patch_W stays [d][ic*kh*kw] (no K-pad).
 // CLIP is resolved from the same match: a prepended cls token (n_prefix rows, prefix from
@@ -1504,11 +1482,7 @@ static OrtStatus* MarshalSiglip(const OrtApi& api, const GraphMaps& m,
     return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: siglip position embedding shape unexpected");
   const int ntok = (int)posr.dims[0];                    // one position row per token (incl any cls)
   int n_head = 0;
-  if (const char* hz = std::getenv("ROCKET_ORT_SIGLIP_HEADS")) n_head = std::atoi(hz);
-  if (n_head <= 0) n_head = d / 64;                       // ViT-B/L head dim is 64
-  if (n_head <= 0 || d % n_head != 0)
-    return api.CreateStatus(ORT_INVALID_GRAPH,
-        "ort-rocket: cannot infer siglip n_head (set ROCKET_ORT_SIGLIP_HEADS)");
+  if (OrtStatus* st = HeadCount(api, m, cb->logger, match.layers[0], d, "plain-ViT", &n_head)) return st;
   // ViT patch grids are square, so the token count splits into a side*side grid plus prefix (cls)
   // tokens: n_prefix = ntok - floor(sqrt(ntok))^2 (0 for SigLIP, 1 for CLIP's cls). The cls-token
   // presence must agree with the matcher's structural class-embedding find.
@@ -1678,11 +1652,7 @@ static OrtStatus* MarshalDepth(const OrtApi& api, const GraphMaps& m,
   else if (posr.dims.size() == 3 && (int)posr.dims[0] == 1 && (int)posr.dims[2] == d) ntok = (int)posr.dims[1];
   else return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: depth position embedding shape unexpected");
   int n_head = 0;
-  if (const char* hz = std::getenv("ROCKET_ORT_SIGLIP_HEADS")) n_head = std::atoi(hz);
-  if (n_head <= 0) n_head = d / 64;                                  // DA v2 S/B/L are all head-dim 64
-  if (n_head <= 0 || d % n_head != 0)
-    return api.CreateStatus(ORT_INVALID_GRAPH,
-        "ort-rocket: cannot infer depth n_head (set ROCKET_ORT_SIGLIP_HEADS)");
+  if (OrtStatus* st = HeadCount(api, m, cb->logger, match.layers[0], d, "Depth Anything", &n_head)) return st;
   int side = 1; while ((side + 1) * (side + 1) <= ntok) side++;
   const int L = side * side;
   const int n_prefix = ntok - L;                                     // the cls token
@@ -2178,15 +2148,15 @@ static OrtStatus* ActQuantOfNodeRef(const OrtApi& api, const GraphMaps& m, const
     RawInit z;
     if (OrtStatus* st = ReadInit(api, m, din[2], &z)) return st;
     // i8_gemm quantizes activations into int8_t [-128,127]. A quint8-activation model
-    // (--activation-type quint8) has a uint8 zero-point ~128 and codes in [0,255]; storing those as
-    // int8_t saturates the entire positive half -> silent-wrong. The zero-point dtype mirrors the
-    // quantized activation dtype, so reject uint8 here. This fails MarshalInt8 and the caller falls
-    // back to fp16 (or, under STRICT, aborts) rather than silently miscomputing.
+    // (activation_type=QuantType.QUInt8) has a uint8 zero-point ~128 and codes in [0,255];
+    // storing those as int8_t saturates the entire positive half -> silent-wrong. The zero-point
+    // dtype mirrors the quantized activation dtype, so reject uint8 here. This fails MarshalInt8 and
+    // the caller runs the fp16 path (or, under STRICT, declines the claim) rather than miscomputing.
     if (z.et == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8)
       return api.CreateStatus(ORT_INVALID_GRAPH,
           "ort-rocket: ROCKET_ORT_INT8 needs int8 (qint8) activations; this model quantized "
-          "activations as uint8 (quint8), which i8_gemm cannot represent -- re-export with "
-          "--activation-type qint8, or use the default fp16 path");
+          "activations as uint8 (quint8), which i8_gemm cannot represent -- re-quantize with "
+          "activation_type=QuantType.QInt8, or use the default fp16 path");
     if (z.count == 1) *a_zp = QAt(z, 0);
   }
   return nullptr;
@@ -2252,7 +2222,7 @@ static OrtStatus* MarshalInt8Patch(const OrtApi& api, const GraphMaps& m, Compil
 }
 
 // Marshal all 5 encoder projections + patch as native int8, driven by the structural match. On any
-// failure the caller falls back to the fp16 path (this is an opt-in faithfulness mode, never fatal).
+// failure the caller runs the fp16 path, or under ROCKET_ORT_STRICT declines the claim.
 static OrtStatus* MarshalInt8(const OrtApi& api, const GraphMaps& m,
                               const rocket_match::BackboneMatch& match, CompiledBackbone* cb) {
   const rocket_backbone_geom* g = cb->w.geom;
@@ -2275,27 +2245,24 @@ static OrtStatus* MarshalInt8(const OrtApi& api, const GraphMaps& m,
   return nullptr;
 }
 
-// Validate the fused node has exactly one output (the projector feature map). Its identity is fixed
-// structurally by the matcher's exit tensor -- the ancestor-set claim guarantees a single convex
-// boundary -- so no output-name check is needed here.
-static OrtStatus* MapOutputs(const OrtApi& api, const OrtNode* fused, CompiledBackbone* /*cb*/) {
+// Validate the fused node has exactly one output, the encoder's exit tensor. GetCapability already
+// checked that the claim's boundary has one output, so a mismatch here is an internal inconsistency.
+static OrtStatus* MapOutputs(const OrtApi& api, const OrtNode* fused) {
   size_t no = 0;
   if (OrtStatus* st = api.Node_GetNumOutputs(fused, &no)) return st;
   if (no != 1)
     return api.CreateStatus(ORT_INVALID_GRAPH,
-        ("ort-rocket: expected 1 fused output (the projector map), got " + std::to_string(no) +
-         " (partition boundary is not the projector output)").c_str());
+        ("ort-rocket: expected 1 fused output (the encoder exit), got " + std::to_string(no)).c_str());
   return nullptr;
 }
 
 // A DPT head reads several encoder taps, so the fused node has one output per tap. Their ORDER is
 // ORT's, not the matcher's, so resolve it by NAME: each fused output must be one of the tap tensors
-// the claim seeded on, and every tap must appear exactly once. Compute then writes tap t into
-// tap_out_slot[t]. Getting this wrong would silently feed the head's four reassemble stages the
-// wrong depths, so a mismatch is fatal rather than best-effort.
-static OrtStatus* MapDepthOutputs(const OrtApi& api, const OrtNode* fused,
-                                  const rocket_match::BackboneMatch& match, CompiledBackbone* cb) {
-  const size_t ntaps = match.tap_tensors.size();
+// the claim seeded on (cb->tap_names), and every tap must appear exactly once. Compute then writes
+// tap t into tap_out_slot[t]. Getting this wrong would silently feed the head's four reassemble
+// stages the wrong depths, so a mismatch is fatal rather than best-effort.
+static OrtStatus* MapDepthOutputs(const OrtApi& api, const OrtNode* fused, CompiledBackbone* cb) {
+  const size_t ntaps = cb->tap_names.size();
   size_t no = 0;
   if (OrtStatus* st = api.Node_GetNumOutputs(fused, &no)) return st;
   if (no != ntaps)
@@ -2311,12 +2278,12 @@ static OrtStatus* MapDepthOutputs(const OrtApi& api, const OrtNode* fused,
     if (OrtStatus* st = api.GetValueInfoName(outs[i], &nm)) return st;
     if (!nm) continue;
     for (size_t t = 0; t < ntaps; t++)
-      if (match.tap_tensors[t] == nm) { cb->tap_out_slot[t] = i; break; }
+      if (cb->tap_names[t] == nm) { cb->tap_out_slot[t] = i; break; }
   }
   for (size_t t = 0; t < ntaps; t++)
     if (cb->tap_out_slot[t] == no)
       return api.CreateStatus(ORT_INVALID_GRAPH,
-          ("ort-rocket: DPT tap " + std::to_string(t) + " (" + match.tap_tensors[t] +
+          ("ort-rocket: DPT tap " + std::to_string(t) + " (" + cb->tap_names[t] +
            ") is not among the fused node's outputs").c_str());
   return nullptr;
 }
@@ -2537,295 +2504,519 @@ static OrtStatus* MarshalModernBert(const OrtApi& api, const GraphMaps& m,
   return nullptr;
 }
 
-// The fused node's runtime inputs, by name: the token ids, the type ids, and the one remaining
-// non-initializer input (the attention mask), if any.
+// A ModernBERT claim's non-initializer inputs, by name: the token ids, the type ids when the model
+// has a type gather, and at most one other, the attention mask. role[i] gets 0 for the ids, 1 for the
+// type ids and 2 for the mask. Returns "" when the inputs fit, else why they do not.
+static std::string ModernBertInputRoles(const std::vector<std::string>& names, const CompiledBackbone& cb,
+                                        std::vector<int>* role) {
+  role->assign(names.size(), -1);
+  bool ids = false, type = false, mask = false;
+  for (size_t i = 0; i < names.size(); i++) {
+    if (names[i] == cb.mb_ids_name) { (*role)[i] = 0; ids = true; }
+    else if (!cb.mb_type_name.empty() && names[i] == cb.mb_type_name) { (*role)[i] = 1; type = true; }
+    else if (!mask) { (*role)[i] = 2; mask = true; }
+    else return "the encoder reads more than one input besides the token and type ids";
+  }
+  if (!ids) return "the token-id input is not an input of the encoder subgraph";
+  if (!cb.mb_type_name.empty() && !type) return "the type-id input is not an input of the encoder subgraph";
+  return std::string();
+}
+
+// The fused node's runtime inputs, by name (see ModernBertInputRoles).
 static OrtStatus* MapModernBertInputs(const OrtApi& api, const OrtNode* fused, const GraphMaps& m,
-                                      const rocket_match::ModernBertMatch& mb, CompiledBackbone* cb) {
+                                      CompiledBackbone* cb) {
   size_t nin = 0;
   if (OrtStatus* st = api.Node_GetNumInputs(fused, &nin)) return st;
   std::vector<const OrtValueInfo*> ins(nin);
   if (OrtStatus* st = api.Node_GetInputs(fused, ins.data(), nin)) return st;
+  std::vector<std::string> names;
+  std::vector<size_t> idx;
   for (size_t i = 0; i < nin; i++) {
     if (!ins[i]) continue;
     const char* nm = nullptr;
     if (OrtStatus* st = api.GetValueInfoName(ins[i], &nm)) return st;
     if (!nm || m.init.count(nm)) continue;
-    if (mb.ids_input == nm) cb->mb_ids_idx = i;
-    else if (!mb.type_input.empty() && mb.type_input == nm) cb->mb_type_idx = i;
-    else if (cb->mb_mask_idx == CompiledBackbone::kNoInput) cb->mb_mask_idx = i;
-    else return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: more than one attention-mask-like input");
+    names.emplace_back(nm);
+    idx.push_back(i);
   }
-  if (cb->mb_ids_idx == CompiledBackbone::kNoInput)
-    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: the token-id input is not on the fused node");
-  if (mb.type_gather && cb->mb_type_idx == CompiledBackbone::kNoInput)
-    return api.CreateStatus(ORT_INVALID_GRAPH, "ort-rocket: the type-id input is not on the fused node");
+  std::vector<int> role;
+  const std::string why = ModernBertInputRoles(names, *cb, &role);
+  if (!why.empty()) return api.CreateStatus(ORT_INVALID_GRAPH, ("ort-rocket: " + why).c_str());
+  for (size_t j = 0; j < names.size(); j++) {
+    if (role[j] == 0) cb->mb_ids_idx = idx[j];
+    else if (role[j] == 1) cb->mb_type_idx = idx[j];
+    else cb->mb_mask_idx = idx[j];
+  }
   return nullptr;
 }
 
-// Compile one claimed encoder subgraph (the family claim). `graph` is the fused subgraph, `fused` its
-// fused node; the compute info comes back in *out_info.
-static OrtStatus* CompileFamily(RocketEp* ep, const OrtGraph* graph, const OrtNode* fused,
-                                OrtNodeComputeInfo** out_info) {
-  const OrtApi& api = ep->ort_api;
-  const OrtGraph* const* graphs = &graph;
-  const OrtNode* const* fused_nodes = &fused;
-  OrtNodeComputeInfo** node_compute_infos = out_info;
+// The boundary ONNX Runtime gives a family claim's fused node: the claim's inputs that are neither
+// produced inside it nor initializers (the image, or the token, mask and type ids), and the tensors
+// it produces that a node outside it reads or that are graph outputs.
+struct FamilyBoundary {
+  std::vector<std::string> inputs;
+  std::vector<const OrtValueInfo*> input_infos;   // aligned with inputs
+  std::vector<std::string> outputs;
+  bool qdq = false;                               // a DequantizeLinear inside the claim
+};
 
+static const char* FamilyName(rocket_match::Family f) {
+  switch (f) {
+    case rocket_match::Family::DinoV2RfDetr:     return "RF-DETR";
+    case rocket_match::Family::SiglipVit:        return "CLIP/SigLIP";
+    case rocket_match::Family::SamVitDet:        return "SAM";
+    case rocket_match::Family::DepthAnythingDpt: return "Depth Anything v2";
+    case rocket_match::Family::ModernBert:       return "ModernBERT";
+    default:                                     return "matched";
+  }
+}
+
+// A default-on switch is off when set to an integer 0; a default-off switch is on when set to a
+// nonzero integer.
+static bool EnvOff(const char* name) { const char* e = std::getenv(name); return e && std::atoi(e) == 0; }
+static bool EnvOn(const char* name)  { const char* e = std::getenv(name); return e && std::atoi(e) != 0; }
+
+// rocket_siglip_encode, the one-shot plain-ViT encoder, runs only SigLIP's configuration: no prefix
+// (cls) token, no pre-encoder LayerNorm, gelu-tanh, a patch bias, a post-LayerNorm and a single exit
+// (rocket_siglip.h). CLIP and Depth Anything need the resident context.
+static bool SiglipOneShotRuns(const rocket_siglip_model& sm) {
+  return sm.n_prefix == 0 && !sm.prefix && !sm.pre_g && sm.act_kind == 0 && sm.patch_b && sm.post_g &&
+         sm.n_taps == 0;
+}
+
+// Build the family claim's compiled state: check the claim's boundary, marshal the weights, open the
+// NPU and pack the resident context. GetCapability runs this on the full graph BEFORE it claims, so
+// every refusal a matched model can meet leaves its encoder on ONNX Runtime's CPU kernels with a
+// warning. In Compile the same refusal would fail session creation, because the EP API cannot return
+// a claimed node to the CPU. Returns "" and fills *out, or the reason the EP does not claim.
+static std::string PrepareFamily(RocketEp* ep, const GraphMaps& m, const rocket_match::BackboneMatch& match,
+                                 const FamilyBoundary& b, std::unique_ptr<CompiledBackbone>* out) {
+  using rocket_match::Family;
+  const OrtApi& api = ep->ort_api;
+  const Family fam = match.family;
+  std::string why;
+  auto failed = [&](OrtStatus* st) -> bool {   // a marshaling refusal becomes the reason
+    if (!st) return false;
+    const char* msg = api.GetErrorMessage(st);
+    why = msg ? msg : "marshaling failed";
+    if (why.rfind("ort-rocket: ", 0) == 0) why.erase(0, 12);
+    api.ReleaseStatus(st);
+    return true;
+  };
+
+  // The boundary Compile maps: one image in for a vision family, and the exit tensor out, or one
+  // output per tap for Depth Anything. ModernBERT's inputs are sorted after its marshaling.
+  if (fam != Family::ModernBert && b.inputs.size() != 1)
+    return "the encoder reads " + std::to_string(b.inputs.size()) + " graph inputs, and the EP takes one image";
+  if (fam == Family::DepthAnythingDpt) {
+    std::vector<std::string> o = b.outputs, t = match.tap_tensors;
+    std::sort(o.begin(), o.end());
+    std::sort(t.begin(), t.end());
+    if (o != t) return "a tensor inside the encoder other than its taps is read outside it";
+  } else if (b.outputs.size() != 1) {
+    return "the encoder has " + std::to_string(b.outputs.size()) +
+           " outputs read outside it, and the EP writes one";
+  }
+  if (b.qdq && fam != Family::DinoV2RfDetr)
+    return "it is a QDQ model, and the EP reads QDQ weights for RF-DETR only";
+
+  const bool mb_host = fam == Family::ModernBert && EnvOn("ROCKET_ORT_MB_HOST");
+  if (!mb_host) {
+    why = ChipWhy();
+    if (!why.empty()) return why;
+  }
+  const bool resident = !EnvOff("ROCKET_ORT_RESIDENT");
   auto cb = std::make_unique<CompiledBackbone>(api);
   cb->logger = &ep->logger;
-  // GetCapability already ran the structural match on the full graph and only claimed on success
-  // (a non-matching graph is left entirely on CPU, never reaching here). This re-runs the match
-  // on the fused subgraph -- which contains exactly the claimed nodes -- to drive edge-walk weight
-  // marshaling. A failure here is an internal inconsistency (the claim and the marshal disagree), not
-  // an export-name mismatch; surface it clearly. There is no CPU fallback at Compile, so it matters
-  // that GetCapability shoulders the accept/reject decision up front.
-  auto stage = [&](OrtStatus* st, const char* where) -> OrtStatus* {
-    if (!st) return nullptr;
-    const char* msg = api.GetErrorMessage(st);
-    ep->Log(ORT_LOGGING_LEVEL_ERROR,
-            std::string("ort-rocket: Compile failed in ") + where + ": " + (msg ? msg : "") +
-                ". The structurally-claimed subgraph could not be marshaled; session creation will "
-                "abort. This indicates a matcher/marshaler inconsistency, please report it.");
-    return st;
-  };
-  const char* iz = std::getenv("ROCKET_ORT_INT8");
-  const bool want_int8 = iz && std::atoi(iz) != 0;
-  // ROCKET_ORT_STRICT: fail loudly on the pinned-export assumptions instead of silently. It does
-  // not change the always-on guards below (geometry alignment and input shape/dtype are always
-  // enforced); it adds a Compile-time self-check summary and escalates the otherwise-soft int8
-  // marshaling miss from a silent fp16 fallback to a hard Compile failure.
-  const char* sz = std::getenv("ROCKET_ORT_STRICT");
-  const bool strict = sz && std::atoi(sz) != 0;
 
-  // Structural match on the fused subgraph (drives the edge-walk marshaling below).
-  rocket_match::BackboneMatch match = rocket_match::MatchAny(api, graphs[0]);
-  if (!match.ok)
-    return api.CreateStatus(ORT_EP_FAIL,
-        (std::string("ort-rocket: the claimed subgraph did not re-match structurally at Compile (") +
-         match.reason + "); this is an internal inconsistency").c_str());
-  GraphMaps maps;
-  if (OrtStatus* st = stage(BuildMaps(api, graphs[0], maps), "BuildMaps")) return st;
-
-  // ModernBERT (with the Laya decision head as its post stack): the resident encoder opens its own
-  // worker fds, so this branch runs before the shared fd below. ROCKET_ORT_MB_HOST=1 selects the
-  // encoder's host mode (no device), which checks the whole EP path off-device.
-  if (match.family == rocket_match::Family::ModernBert) {
-    if (OrtStatus* st = stage(MarshalModernBert(api, maps, match, cb.get()), "MarshalModernBert")) return st;
-    if (OrtStatus* st = stage(MapModernBertInputs(api, fused_nodes[0], maps, match.mb, cb.get()),
-                              "MapModernBertInputs"))
-      return st;
-    int nthreads = 3;
-    if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 8) nthreads = v; }
-    if (const char* hz = std::getenv("ROCKET_ORT_MB_HOST")) if (std::atoi(hz) != 0) nthreads = 0;
+  // ModernBERT (with the Laya decision head as its post stack): the encoder opens its own worker
+  // fds, so it takes no shared fd. ROCKET_ORT_MB_HOST=1 selects the encoder's host mode (no device),
+  // which checks the whole EP path off-device. It is always resident; ROCKET_ORT_RESIDENT does not
+  // apply.
+  if (fam == Family::ModernBert) {
+    if (failed(MarshalModernBert(api, m, match, cb.get()))) return why;
+    cb->mb_ids_name = match.mb.ids_input;
+    cb->mb_type_name = match.mb.type_gather ? match.mb.type_input : std::string();
+    std::vector<int> role;
+    why = ModernBertInputRoles(b.inputs, *cb, &role);
+    if (!why.empty()) return why;
+    const int nthreads = mb_host ? 0 : ep->Threads();
     cb->mbctx = rocket_modernbert_ctx_create(&cb->mbm, nthreads);
     if (!cb->mbctx)
-      return api.CreateStatus(ORT_EP_FAIL,
-          "ort-rocket: ModernBERT ctx create failed (the device, or a weight pack past the IOVA window)");
+      return "the ModernBERT context did not build (the NPU did not open, or a weight pack exceeded "
+             "the IOVA window)";
     cb->is_mb = true;
     const rocket_modernbert_model& M = cb->mbm;
     int nslide = 0;
     for (int l = 0; l < M.n_layers; l++) nslide += M.layers[l].sliding;
     ep->Log(ORT_LOGGING_LEVEL_INFO,
-            "ort-rocket: ModernBERT encoder compiled; d=" + std::to_string(M.d) + " heads=" +
+            "ort-rocket: ModernBERT encoder built; d=" + std::to_string(M.d) + " heads=" +
                 std::to_string(M.n_head) + " layers=" + std::to_string(M.n_layers) + " (" +
                 std::to_string(nslide) + " sliding, window " + std::to_string(M.window) + ") d_ff=" +
                 std::to_string(M.d_ff) + " post=" + std::to_string(M.n_post) + " vocab=" +
                 std::to_string(cb->mb_vocab) + ", mode=" + (nthreads ? "npu" : "host"));
-    auto info = std::make_unique<BackboneComputeInfo>(cb.release());
-    node_compute_infos[0] = info.release();
-    return nullptr;
+    *out = std::move(cb);
+    return std::string();
   }
 
   cb->fd = rocket_open();
   if (cb->fd < 0)
-    return api.CreateStatus(ORT_EP_FAIL,
-                            ("ort-rocket: rocket_open failed (" + std::to_string(cb->fd) +
-                             "); is /dev/accel/accel0 present and privileged?").c_str());
+    return "the NPU did not open (rocket_open returned " + std::to_string(cb->fd) +
+           "); is /dev/accel/accel0 present, and may this process open it?";
 
   // Depth Anything v2: the DINOv2 encoder marshals into the plain-ViT compute (LayerScale folded
   // into the projections, the fused qkv sliced by its derived column blocks), configured to emit one
-  // normalized block per DPT tap. The head stays on the host, so the fused node has one output per
-  // tap rather than one. Self-contained path, like SigLIP/SAM.
-  if (match.family == rocket_match::Family::DepthAnythingDpt) {
-    if (OrtStatus* st = stage(MarshalDepth(api, maps, match, cb.get()), "MarshalDepth")) return st;
-    if (OrtStatus* st = stage(MapImageInput(api, fused_nodes[0], maps, cb.get()), "MapImageInput")) return st;
-    if (OrtStatus* st = stage(MapDepthOutputs(api, fused_nodes[0], match, cb.get()), "MapDepthOutputs")) return st;
+  // normalized block per DPT tap. Only the resident encoder runs taps.
+  if (fam == Family::DepthAnythingDpt) {
+    if (failed(MarshalDepth(api, m, match, cb.get()))) return why;
+    if (!resident)
+      return "ROCKET_ORT_RESIDENT=0 selects the one-shot encoder, which does not run Depth Anything's taps";
+    cb->sctx = rocket_siglip_ctx_create(&cb->sm, ep->Threads());
+    if (!cb->sctx)
+      return "the resident encoder did not build (a weight pack past the IOVA window?), and the "
+             "one-shot encoder does not run Depth Anything's taps";
     cb->is_depth = true;
-    const char* rz = std::getenv("ROCKET_ORT_RESIDENT");
-    if (!(rz && std::atoi(rz) == 0)) {   // resident by default; one-shot when ROCKET_ORT_RESIDENT=0
-      int nthreads = 3;
-      if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
-      cb->sctx = rocket_siglip_ctx_create(&cb->sm, nthreads);
-      if (!cb->sctx)
-        ep->Log(ORT_LOGGING_LEVEL_WARNING,
-                "ort-rocket: depth resident ctx create failed; the one-shot encoder does not serve a "
-                "multi-tap model, so Compute will fail -- check the weight pack (IOVA limit?)");
-    }
+    cb->tap_names = match.tap_tensors;
     std::string taps;
     for (size_t t = 0; t < match.tap_layers.size(); t++)
       taps += (t ? "," : "") + std::to_string(match.tap_layers[t]);
     ep->Log(ORT_LOGGING_LEVEL_INFO,
-            std::string("ort-rocket: Depth Anything v2 encoder compiled; image input at index ") +
-                std::to_string(cb->image_in_idx) + ", d=" + std::to_string(cb->sm.d) + " heads=" +
+            "ort-rocket: Depth Anything v2 encoder built; d=" + std::to_string(cb->sm.d) + " heads=" +
                 std::to_string(cb->sm.n_head) + " layers=" + std::to_string(cb->sm.n_layers) +
                 " ntok=" + std::to_string(cb->sm.L + cb->sm.n_prefix) + " taps=[" + taps + "] img=" +
-                std::to_string(cb->sm.image_size) + ", mode=" + (cb->sctx ? "resident" : "one-shot"));
-    auto info = std::make_unique<BackboneComputeInfo>(cb.release());
-    node_compute_infos[0] = info.release();
-    return nullptr;
+                std::to_string(cb->sm.image_size) + ", mode=resident");
+    *out = std::move(cb);
+    return std::string();
   }
 
-  // Plain-ViT (SigLIP) family: marshal into the rocket_siglip encoder and hand back its compute.
-  // Its geometry/IO is not DINOv2's (no projector, output [1,L,d]), so it takes a self-contained
-  // path and returns before the DINOv2 geometry/projector/int8 wiring below.
-  if (match.family == rocket_match::Family::SiglipVit) {
-    if (OrtStatus* st = stage(MarshalSiglip(api, maps, match, cb.get()), "MarshalSiglip")) return st;
-    if (OrtStatus* st = stage(MapImageInput(api, fused_nodes[0], maps, cb.get()), "MapImageInput")) return st;
-    if (OrtStatus* st = stage(MapOutputs(api, fused_nodes[0], cb.get()), "MapOutputs")) return st;
-    cb->is_siglip = true;
-    const char* rz = std::getenv("ROCKET_ORT_RESIDENT");
-    if (!(rz && std::atoi(rz) == 0)) {   // resident by default; one-shot when ROCKET_ORT_RESIDENT=0
-      int nthreads = 3;
-      if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
-      cb->sctx = rocket_siglip_ctx_create(&cb->sm, nthreads);
+  // CLIP and SigLIP: the one-shot encoder runs SigLIP's configuration only, so CLIP needs the
+  // resident context.
+  if (fam == Family::SiglipVit) {
+    if (failed(MarshalSiglip(api, m, match, cb.get()))) return why;
+    const bool oneshot = SiglipOneShotRuns(cb->sm);
+    const std::string variant = cb->sm.n_prefix > 0 ? "CLIP" : "SigLIP";
+    if (!resident && !oneshot)
+      return "ROCKET_ORT_RESIDENT=0 selects the one-shot encoder, which does not run " + variant +
+             " (it runs SigLIP's configuration only)";
+    if (resident) {
+      cb->sctx = rocket_siglip_ctx_create(&cb->sm, ep->Threads());
+      if (!cb->sctx && !oneshot)
+        return "the resident encoder did not build (a weight pack past the IOVA window?), and the "
+               "one-shot encoder does not run " + variant;
       if (!cb->sctx)
         ep->Log(ORT_LOGGING_LEVEL_WARNING,
-                "ort-rocket: siglip resident ctx create failed; falling back to the one-shot encoder");
+                "ort-rocket: the resident SigLIP encoder did not build; running the one-shot encoder");
     }
+    cb->is_siglip = true;
     ep->Log(ORT_LOGGING_LEVEL_INFO,
-            std::string("ort-rocket: plain-ViT (") + (cb->sm.n_prefix > 0 ? "CLIP" : "SigLIP") +
-                ") encoder compiled; image input at index " + std::to_string(cb->image_in_idx) +
-                ", d=" + std::to_string(cb->sm.d) + " heads=" + std::to_string(cb->sm.n_head) +
-                " layers=" + std::to_string(cb->sm.n_layers) + " L=" + std::to_string(cb->sm.L) +
-                " n_prefix=" + std::to_string(cb->sm.n_prefix) + " act=" +
-                (cb->sm.act_kind ? "quick_gelu" : "gelu_tanh") + " img=" +
+            "ort-rocket: plain-ViT (" + variant + ") encoder built; d=" + std::to_string(cb->sm.d) +
+                " heads=" + std::to_string(cb->sm.n_head) + " layers=" + std::to_string(cb->sm.n_layers) +
+                " L=" + std::to_string(cb->sm.L) + " n_prefix=" + std::to_string(cb->sm.n_prefix) +
+                " act=" + (cb->sm.act_kind ? "quick_gelu" : "gelu_tanh") + " img=" +
                 std::to_string(cb->sm.image_size) + ", mode=" + (cb->sctx ? "resident" : "one-shot"));
-    auto info = std::make_unique<BackboneComputeInfo>(cb.release());
-    node_compute_infos[0] = info.release();
-    return nullptr;
+    *out = std::move(cb);
+    return std::string();
   }
 
-  // SAM ViT-Det family: marshal into the rocket_sam encoder (its own geometry/IO -- output
-  // [1,neck_out,grid,grid]), like the plain-ViT path, and return before the DINOv2 wiring below.
-  if (match.family == rocket_match::Family::SamVitDet) {
-    if (OrtStatus* st = stage(MarshalSam(api, maps, match, cb.get()), "MarshalSam")) return st;
-    if (OrtStatus* st = stage(MapImageInput(api, fused_nodes[0], maps, cb.get()), "MapImageInput")) return st;
-    if (OrtStatus* st = stage(MapOutputs(api, fused_nodes[0], cb.get()), "MapOutputs")) return st;
-    cb->is_sam = true;
-    const char* rz = std::getenv("ROCKET_ORT_RESIDENT");
-    if (!(rz && std::atoi(rz) == 0)) {   // resident by default; one-shot when ROCKET_ORT_RESIDENT=0
-      int nthreads = 3;
-      if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) { int v = std::atoi(tz); if (v >= 1 && v <= 16) nthreads = v; }
-      cb->sctx2 = rocket_sam_ctx_create(&cb->sm2, nthreads);
+  // SAM ViT-Det: the rocket_sam encoder, whose one-shot path serves the same models.
+  if (fam == Family::SamVitDet) {
+    if (failed(MarshalSam(api, m, match, cb.get()))) return why;
+    if (resident) {
+      cb->sctx2 = rocket_sam_ctx_create(&cb->sm2, ep->Threads());
       if (!cb->sctx2)
         ep->Log(ORT_LOGGING_LEVEL_WARNING,
-                "ort-rocket: SAM resident ctx create failed; falling back to the one-shot encoder");
+                "ort-rocket: the resident SAM encoder did not build; running the one-shot encoder");
     }
+    cb->is_sam = true;
     ep->Log(ORT_LOGGING_LEVEL_INFO,
-            std::string("ort-rocket: SAM ViT-Det encoder compiled; image input at index ") +
-                std::to_string(cb->image_in_idx) + ", d=" + std::to_string(cb->sm2.d) + " heads=" +
+            "ort-rocket: SAM ViT-Det encoder built; d=" + std::to_string(cb->sm2.d) + " heads=" +
                 std::to_string(cb->sm2.n_head) + " layers=" + std::to_string(cb->sm2.n_layers) +
                 " grid=" + std::to_string(cb->sm2.grid) + " win=" + std::to_string(cb->sm2.win) +
                 " neck_out=" + std::to_string(cb->sm2.neck_out) + " img=" +
                 std::to_string(cb->sm2.image_size) + ", mode=" + (cb->sctx2 ? "resident" : "one-shot"));
-    auto info = std::make_unique<BackboneComputeInfo>(cb.release());
-    node_compute_infos[0] = info.release();
-    return nullptr;
+    *out = std::move(cb);
+    return std::string();
   }
 
-  // Only the DINOv2/RF-DETR family remains wired below. Reaching here with another family is an
-  // internal inconsistency (GetCapability claims only wired families) -- fail loudly, no fallback.
-  if (match.family != rocket_match::Family::DinoV2RfDetr)
-    return api.CreateStatus(ORT_EP_FAIL,
-        "ort-rocket: matched a backbone family with no Compile marshaling path");
+  if (fam != Family::DinoV2RfDetr) return "the matched family has no marshaling path";
 
-  if (OrtStatus* st = stage(MarshalWeights(api, maps, match, cb.get()), "MarshalWeights")) return st;
-  if (OrtStatus* st = stage(MarshalProjector(api, maps, cb.get()), "MarshalProjector")) return st;
-  if (OrtStatus* st = stage(MapImageInput(api, fused_nodes[0], maps, cb.get()), "MapImageInput")) return st;
-  if (OrtStatus* st = stage(MapOutputs(api, fused_nodes[0], cb.get()), "MapOutputs")) return st;
-
-  // Reject a geometry whose M (ntok/np) is not %4 -- the prepacked matmul would return garbage
-  // at rc=0. Always-on; both shipping variants pass, so this only fires on a future table entry.
+  // RF-DETR: the EP's own backbone and projector.
+  if (failed(MarshalWeights(api, m, match, cb.get()))) return why;
+  if (failed(MarshalProjector(api, m, cb.get()))) return why;
+  // A geometry whose M (ntok/np) is not a multiple of 4 is one the prepacked matmul refuses (-1) on
+  // every image. Always-on; both shipping variants pass, so this only fires on a future table entry.
   {
-    const char* why = nullptr;
-    if (rocket_backbone_geom_check(cb->w.geom, &why) != 0)
-      return api.CreateStatus(ORT_INVALID_GRAPH,
-          (std::string("ort-rocket: selected geometry fails a matmul-alignment invariant: ") +
-           (why ? why : "unknown") + " -- this variant cannot compute correctly on the NPU").c_str());
+    const char* gw = nullptr;
+    if (rocket_backbone_geom_check(cb->w.geom, &gw) != 0)
+      return std::string("the selected geometry fails a matmul-alignment invariant: ") + (gw ? gw : "unknown");
   }
-  // Compile-time image-input check: validate the image input dtype/shape against the selected geometry.
   bool shape_concrete = false;
-  if (OrtStatus* st = stage(ValidateImageShape(api, fused_nodes[0], cb.get(), &shape_concrete),
-                            "ValidateImageShape"))
-    return st;
+  if (failed(ValidateImageShape(api, b.input_infos[0], cb->w.geom, &shape_concrete))) return why;
 
-  // Opt-in native-int8 encoder projections. Marshals the raw int8 weights on top of the fp16
-  // ones; on any miss (fp32/int4/asymmetric/quint8-activation model) it logs and falls back to the
-  // fp16 path -- never fatal, unless ROCKET_ORT_STRICT escalates it. Slower than fp16 on this stack
-  // (int8 matmul reads int32 back to the host); a faithfulness/experimentation mode, not the
+  // ROCKET_ORT_STRICT: fail loudly on the pinned-export assumptions instead of silently. It does not
+  // change the always-on guards above (geometry alignment and input shape/dtype are always enforced);
+  // it adds a self-check summary, and turns the otherwise-soft int8 misses below from an fp16 fallback
+  // into a declined claim logged at ERROR, so a run that asked for int8 never passes on the fp16
+  // path. A refusal cannot fail session creation from here: ONNX Runtime logs a GetCapability error
+  // and places the whole graph on its CPU kernels.
+  const bool strict = EnvOn("ROCKET_ORT_STRICT");
+  auto int8_miss = [&](const std::string& what) -> bool {   // true: STRICT declines the claim
+    if (strict) {
+      ep->Log(ORT_LOGGING_LEVEL_ERROR, "ort-rocket: " + what + " under ROCKET_ORT_STRICT, so the EP "
+                                       "does not claim the encoder rather than run the fp16 path");
+      why = what + " under ROCKET_ORT_STRICT";
+      return true;
+    }
+    ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: " + what + "; running the fp16 path");
+    return false;
+  };
+
+  // Opt-in native-int8 encoder projections. Marshals the raw int8 weights on top of the fp16 ones; a
+  // miss (fp32/int4/asymmetric/quint8-activation model) runs the fp16 path. Slower than fp16 on this
+  // stack (int8 matmul reads int32 back to the host); a faithfulness/experimentation mode, not the
   // default. See rocket_backbone.h.
-  if (want_int8) {
-    if (OrtStatus* st = MarshalInt8(api, maps, match, cb.get())) {
+  if (EnvOn("ROCKET_ORT_INT8")) {
+    if (OrtStatus* st = MarshalInt8(api, m, match, cb.get())) {
       const char* msg = api.GetErrorMessage(st);
-      if (strict) {
-        ep->Log(ORT_LOGGING_LEVEL_ERROR, std::string("ort-rocket: ROCKET_ORT_INT8 marshaling failed "
-                "under ROCKET_ORT_STRICT (") + (msg ? msg : "") + "); aborting rather than falling "
-                "back to fp16");
-        return st;
-      }
-      ep->Log(ORT_LOGGING_LEVEL_WARNING, std::string("ort-rocket: ROCKET_ORT_INT8 set but native-int8 "
-              "marshaling failed (") + (msg ? msg : "") + "); using the fp16 path");
+      const std::string what = std::string("ROCKET_ORT_INT8 marshaling failed (") + (msg ? msg : "") + ")";
       DiscardStatus(api, st);
-      cb->w.i8 = nullptr;
+      if (int8_miss(what)) return why;
     } else {
       cb->w.i8 = &cb->i8w;
-      ep->Log(ORT_LOGGING_LEVEL_INFO, "ort-rocket: native-int8 encoder projections enabled (W8A8 on "
-              "the NPU; slower than fp16 -- faithfulness mode)");
     }
   }
+
+  // The resident (prepacked, multicore) contexts pack every static weight into NPU BOs once, so
+  // Compute re-packs nothing per image. ROCKET_ORT_RESIDENT=0 runs the one-shot chain, kept as the
+  // A/B reference. A ctx-create failure (e.g. an IOVA-limit weight pack) runs the one-shot chain too.
+  if (resident) {
+    const int nthreads = ep->Threads();
+    cb->bctx = rocket_backbone_ctx_create(&cb->w, nthreads);
+    cb->pctx = rocket_projector_ctx_create(&cb->pw, nthreads);
+    if (!cb->bctx || !cb->pctx) {
+      ep->Log(ORT_LOGGING_LEVEL_WARNING,
+              "ort-rocket: the resident RF-DETR contexts did not build; running the one-shot chain");
+      if (cb->bctx) { rocket_backbone_ctx_free(cb->bctx); cb->bctx = nullptr; }
+      if (cb->pctx) { rocket_projector_ctx_free(cb->pctx); cb->pctx = nullptr; }
+    }
+  }
+  // Only the resident backbone runs int8 projections; the one-shot chain reads the fp16 weights.
+  if (cb->w.i8 && !cb->bctx) {
+    cb->w.i8 = nullptr;
+    if (int8_miss("ROCKET_ORT_INT8 runs only with resident weights")) return why;
+  }
+  if (cb->w.i8)
+    ep->Log(ORT_LOGGING_LEVEL_INFO, "ort-rocket: native-int8 encoder projections enabled (W8A8 on "
+            "the NPU; slower than fp16 -- faithfulness mode)");
 
   if (strict) {
     const rocket_backbone_geom* g = cb->w.geom;
     ep->Log(ORT_LOGGING_LEVEL_INFO,
             "ort-rocket: STRICT self-check OK -- variant patch=" + std::to_string(g->patch) +
                 " img=" + std::to_string(g->img) + " ntok=" + std::to_string(g->ntok) + " np=" +
-                std::to_string(g->np) + " (M%4 ok, N%32 ok); image input idx=" +
-                std::to_string(cb->image_in_idx) + " expects fp32 [1," + std::to_string(RBB_IC) +
-                "," + std::to_string(g->img) + "," + std::to_string(g->img) + "]" +
-                (shape_concrete ? "" : " (input shape is not fully pinned at Compile; the element "
+                std::to_string(g->np) + " (M%4 ok, N%32 ok); the image input expects fp32 or fp16 [1," +
+                std::to_string(RBB_IC) + "," + std::to_string(g->img) + "," + std::to_string(g->img) + "]" +
+                (shape_concrete ? "" : " (its shape is not fully pinned in the graph; the element "
                                        "count is enforced on every Compute)"));
   }
+  ep->Log(ORT_LOGGING_LEVEL_INFO,
+          std::string("ort-rocket: RF-DETR backbone+projector built, mode=") +
+              (cb->bctx ? "resident" : "one-shot"));
+  *out = std::move(cb);
+  return std::string();
+}
 
-  // Build the resident (prepacked, multicore) contexts once, packing every static weight into
-  // NPU BOs so Compute re-packs nothing per image. Disable with ROCKET_ORT_RESIDENT=0 (the
-  // one-shot chain, kept as the A/B reference). Worker count via ROCKET_ORT_THREADS (default
-  // 3 -- matching the 3 NPU cores; more workers oversubscribe and slow the backbone). A
-  // ctx-create failure (e.g. an IOVA-limit weight pack) is not fatal -- log and fall back to
-  // the one-shot chain rather than fail the session.
-  const char* rz = std::getenv("ROCKET_ORT_RESIDENT");
-  bool want_resident = !(rz && std::atoi(rz) == 0);
-  if (want_resident) {
-    int nthreads = 3;
-    if (const char* tz = std::getenv("ROCKET_ORT_THREADS")) {
-      int v = std::atoi(tz);
-      if (v >= 1 && v <= 16) nthreads = v;
-    }
-    cb->bctx = rocket_backbone_ctx_create(&cb->w, nthreads);
-    cb->pctx = rocket_projector_ctx_create(&cb->pw, nthreads);
-    if (!cb->bctx || !cb->pctx) {
+// Claim the first matching family's encoder -- the ancestor set of its exit tensor, or of every DPT
+// tap -- as one fused node. Convex by construction; the boundary is the image (or the token inputs)
+// in and the exit or the taps out. The compiled state is built first (PrepareFamily), and a refusal
+// there claims nothing, so the encoder runs on ONNX Runtime's CPU kernels. Marks the claimed nodes in
+// *claimed_flag_out only when it claims.
+OrtStatus* RocketEp::ClaimFamily(RocketEp* ep, const OrtGraph* graph,
+                                 const std::vector<const OrtNode*>& nodes,
+                                 std::vector<char>* claimed_flag_out,
+                                 OrtEpGraphSupportInfo* support_info) {
+  const OrtApi& api = ep->ort_api;
+  const OrtEpApi& ep_api = *api.GetEpApi();
+  ep->family_state.reset();   // a state an earlier pass built belongs to that pass's claim
+
+  // Structural match: locate the encoder by op topology (no name dependency), trying each registered
+  // family in turn (MatchAny). On any miss -- not a recognized graph, or a graph whose optimizations
+  // were left on so the block was fused away -- claim no encoder and leave it to ORT's CPU kernels.
+  rocket_match::BackboneMatch match = rocket_match::MatchAny(api, graph);
+  if (!match.ok) {
+    ep->Log(ORT_LOGGING_LEVEL_INFO,
+            std::string("ort-rocket: no encoder family matched (") + match.reason +
+                "). This EP offloads the encoder of RF-DETR, CLIP/SigLIP, SAM, Depth Anything v2 and "
+                "ModernBERT; run the session with graph_optimization_level=ORT_DISABLE_ALL so the "
+                "exported op topology survives.");
+    return nullptr;
+  }
+  // DINOv2 selects an RF-DETR variant by patch size and requires the exact encoder-layer count. Patch
+  // 16 collides between RF-DETR and plain-ViT, so this MUST branch on family, not patch size.
+  if (match.family == rocket_match::Family::DinoV2RfDetr) {
+    const rocket_backbone_geom* geom = rocket_backbone_geom_select(match.patch_size);
+    if (!geom || match.layers.size() != static_cast<size_t>(geom->nlayer)) {
       ep->Log(ORT_LOGGING_LEVEL_WARNING,
-              "ort-rocket: resident ctx create failed; falling back to the one-shot chain");
-      if (cb->bctx) { rocket_backbone_ctx_free(cb->bctx); cb->bctx = nullptr; }
-      if (cb->pctx) { rocket_projector_ctx_free(cb->pctx); cb->pctx = nullptr; }
+              "ort-rocket: matched a DINOv2-shaped subgraph (patch " + std::to_string(match.patch_size) +
+                  ", " + std::to_string(match.layers.size()) + " encoder layers) that does not fit a "
+                  "known RF-DETR variant; not claiming the encoder.");
+      return nullptr;
     }
   }
 
+  const size_t num_nodes = nodes.size();
+
+  // producer[tensor name] -> node index; ins[i] -> node i's input edges (name, value info).
+  using Edge = std::pair<std::string, const OrtValueInfo*>;
+  std::unordered_map<std::string, size_t> producer;
+  std::vector<std::vector<Edge>> ins(num_nodes);
+  auto edges = [&](const OrtValueInfo* const* vis, size_t n, std::vector<Edge>* out) -> OrtStatus* {
+    for (size_t k = 0; k < n; k++) {
+      if (!vis[k]) continue;   // omitted optional edge -> null OrtValueInfo* (GetValueInfoName segfaults)
+      const char* nm = nullptr;
+      if (OrtStatus* st = api.GetValueInfoName(vis[k], &nm)) return st;
+      if (nm) out->emplace_back(nm, vis[k]);
+    }
+    return nullptr;
+  };
+  for (size_t i = 0; i < num_nodes; i++) {
+    size_t no = 0, ni = 0;
+    if (OrtStatus* st = api.Node_GetNumOutputs(nodes[i], &no)) return st;
+    std::vector<const OrtValueInfo*> ov(no);
+    if (OrtStatus* st = api.Node_GetOutputs(nodes[i], ov.data(), no)) return st;
+    std::vector<Edge> outs;
+    if (OrtStatus* st = edges(ov.data(), no, &outs)) return st;
+    for (auto& e : outs) producer.emplace(e.first, i);
+    if (OrtStatus* st = api.Node_GetNumInputs(nodes[i], &ni)) return st;
+    std::vector<const OrtValueInfo*> iv(ni);
+    if (OrtStatus* st = api.Node_GetInputs(nodes[i], iv.data(), ni)) return st;
+    if (OrtStatus* st = edges(iv.data(), ni, &ins[i])) return st;
+  }
+
+  // BFS backward from the structurally-found exit tensor(s), collecting all ancestor nodes. A
+  // single-exit family seeds one tensor; a DPT head (DepthAnythingDpt) seeds all of its taps. The
+  // union of ancestor sets is still ancestor-closed, hence still convex, so the multi-seed claim
+  // is as safe a partition as the single-seed one -- it just leaves a fused node with one output
+  // per tap instead of one.
+  std::vector<char> claimed_flag(num_nodes, 0);
+  std::vector<std::string> stack;
+  std::unordered_map<std::string, char> visited;
+  if (!match.tap_tensors.empty())
+    for (const std::string& t : match.tap_tensors) stack.emplace_back(t);
+  else
+    stack.emplace_back(match.exit_tensor);
+  while (!stack.empty()) {
+    std::string t = std::move(stack.back());
+    stack.pop_back();
+    if (visited.count(t)) continue;
+    visited.emplace(t, 1);
+    auto it = producer.find(t);
+    if (it == producer.end()) continue;    // initializer or graph input: stop
+    size_t ni = it->second;
+    claimed_flag[ni] = 1;
+    for (const Edge& in : ins[ni])
+      if (!visited.count(in.first)) stack.push_back(in.first);
+  }
+
+  std::vector<const OrtNode*> claimed;
+  for (size_t i = 0; i < num_nodes; i++)
+    if (claimed_flag[i]) claimed.push_back(nodes[i]);
+  if (claimed.empty()) {   // exit tensor had no producer in this graph -- should not happen post-match
+    ep->Log(ORT_LOGGING_LEVEL_WARNING, "ort-rocket: matched but claimed no nodes; the encoder stays on the CPU.");
+    return nullptr;
+  }
+
+  // The claim's boundary, as ONNX Runtime will build the fused node from it.
+  GraphMaps maps;
+  if (OrtStatus* st = BuildMaps(api, graph, maps)) return st;
+  FamilyBoundary b;
+  {
+    std::unordered_set<std::string> seen_in, seen_out;
+    auto inside = [&](const std::string& t) {
+      auto p = producer.find(t);
+      return p != producer.end() && claimed_flag[p->second];
+    };
+    for (size_t i = 0; i < num_nodes; i++) {
+      if (claimed_flag[i]) {
+        if (NodeOp(api, nodes[i]) == "DequantizeLinear") b.qdq = true;
+        for (const Edge& e : ins[i])
+          if (!inside(e.first) && !maps.init.count(e.first) && seen_in.insert(e.first).second) {
+            b.inputs.push_back(e.first);
+            b.input_infos.push_back(e.second);
+          }
+      } else {
+        for (const Edge& e : ins[i])
+          if (inside(e.first) && seen_out.insert(e.first).second) b.outputs.push_back(e.first);
+      }
+    }
+    size_t ngo = 0;
+    if (OrtStatus* st = api.Graph_GetNumOutputs(graph, &ngo)) return st;
+    std::vector<const OrtValueInfo*> gov(ngo);
+    if (OrtStatus* st = api.Graph_GetOutputs(graph, gov.data(), ngo)) return st;
+    std::vector<Edge> gouts;
+    if (OrtStatus* st = edges(gov.data(), ngo, &gouts)) return st;
+    for (const Edge& e : gouts)
+      if (inside(e.first) && seen_out.insert(e.first).second) b.outputs.push_back(e.first);
+  }
+
+  std::unique_ptr<CompiledBackbone> cb;
+  const std::string why = PrepareFamily(ep, maps, match, b, &cb);
+  if (!why.empty()) {
+    ep->Log(ORT_LOGGING_LEVEL_WARNING,
+            std::string("ort-rocket: not claiming the ") + FamilyName(match.family) +
+                " encoder, which runs on ONNX Runtime's CPU kernels: " + why);
+    return nullptr;
+  }
+  ep->family_state = std::move(cb);
+  *claimed_flag_out = claimed_flag;
+
+  const char* fam_desc =
+      match.family == rocket_match::Family::ModernBert
+          ? "ModernBERT text encoder + post stack, exit the last post layer"
+      : match.family == rocket_match::Family::DepthAnythingDpt
+          ? "Depth Anything v2 DINOv2 encoder, exit the DPT taps (head stays on host)"
+      : match.family == rocket_match::Family::SamVitDet
+          ? "SAM ViT-Det encoder (windowed + rel-pos), exit neck output"
+      : match.family == rocket_match::Family::SiglipVit
+          ? "plain-ViT encoder, exit last_hidden_state"
+          : "DINOv2 backbone+projector";
   ep->Log(ORT_LOGGING_LEVEL_INFO,
-          std::string("ort-rocket: backbone+projector compiled; image input at index ") +
-              std::to_string(cb->image_in_idx) + ", weights marshaled, NPU fd open, mode=" +
-              (cb->bctx ? "resident" : "one-shot"));
-  auto info = std::make_unique<BackboneComputeInfo>(cb.release());
-  node_compute_infos[0] = info.release();
+          "ort-rocket: claiming " + std::to_string(claimed.size()) + " nodes (" + fam_desc +
+              ", patch " + std::to_string(match.patch_size) + ", " +
+              std::to_string(match.layers.size()) + " layers) as one fused node");
+  return ep_api.EpGraphSupportInfo_AddNodesToFuse(support_info, claimed.data(), claimed.size(), nullptr);
+}
+
+// Compile the family claim: take the state GetCapability built and map the fused node's inputs and
+// outputs onto it. `graph` is the fused subgraph, `fused` its fused node; the compute info comes back
+// in *out_info.
+static OrtStatus* CompileFamily(RocketEp* ep, const OrtGraph* graph, const OrtNode* fused,
+                                OrtNodeComputeInfo** out_info) {
+  const OrtApi& api = ep->ort_api;
+  std::unique_ptr<CompiledBackbone> cb = std::move(ep->family_state);
+  if (!cb)
+    return api.CreateStatus(ORT_EP_FAIL,
+        "ort-rocket: Compile received an encoder subgraph that GetCapability did not build; this is an "
+        "internal inconsistency");
+  GraphMaps maps;
+  OrtStatus* st = BuildMaps(api, graph, maps);
+  if (!st) {
+    if (cb->is_mb) {
+      st = MapModernBertInputs(api, fused, maps, cb.get());
+    } else {
+      st = MapImageInput(api, fused, maps, cb.get());
+      if (!st) st = cb->is_depth ? MapDepthOutputs(api, fused, cb.get()) : MapOutputs(api, fused);
+    }
+  }
+  if (st) {
+    const char* msg = api.GetErrorMessage(st);
+    ep->Log(ORT_LOGGING_LEVEL_ERROR,
+            std::string("ort-rocket: Compile could not map the encoder's fused node (") + (msg ? msg : "") +
+                "); session creation will abort. GetCapability checked this boundary, so this is an "
+                "internal inconsistency, please report it.");
+    return st;
+  }
+  *out_info = new BackboneComputeInfo(cb.release());
   return nullptr;
 }
 

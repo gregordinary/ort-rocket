@@ -184,6 +184,25 @@ const OrtNode* ProjMatmulBack(const Ctx& c, const std::string& t, int depth = 14
   return nullptr;
 }
 
+// The shape operand of the Reshape that splits the query into heads: the first Reshape on the walk
+// back from the scores MatMul's query input, crossing layout ops and a scale Mul. Its shape must be a
+// constant of four elements, [batch, tokens, heads, head_dim] with -1 for the inferred one. "" if the
+// first Reshape takes a computed shape, or none is found.
+std::string HeadShapeOf(const Ctx& c, std::string t) {
+  for (int d = 0; d < 8 && !t.empty(); d++) {
+    const OrtNode* p = c.prod(t);
+    if (!p) return std::string();
+    if (c.op(p) == "Reshape") {
+      if (c.ins(p).size() < 2 || !c.is_init(c.ins(p)[1])) return std::string();
+      const std::vector<int64_t>* s = c.init_shape(c.ins(p)[1]);
+      return (s && s->size() == 1 && (*s)[0] == 4) ? c.ins(p)[1] : std::string();
+    }
+    if (!IsLayout(c.op(p)) && c.op(p) != "Mul") return std::string();
+    t = c.act_input(p);
+  }
+  return std::string();
+}
+
 // Skip backward through layout ops (incl a Q/DQ wrap) to the producing MatMul.
 const OrtNode* MatmulBackLayout(const Ctx& c, const std::string& t0) {
   std::string t = t0; std::unordered_set<std::string> seen;
@@ -442,6 +461,7 @@ bool ResolvePlainLayer(const Ctx& c, const OrtNode* sm, MatchedLayer* L) {
   L->bq = BiasAddOf(c, q); L->bk = BiasAddOf(c, k); L->bv = BiasAddOf(c, v);
   L->bo = BiasAddOf(c, o); L->bf1 = BiasAddOf(c, fc1); L->bf2 = BiasAddOf(c, fc2);
   L->norm1 = norm1; L->norm2 = norm2; L->ls1 = nullptr; L->ls2 = nullptr;
+  L->head_shape = HeadShapeOf(c, c.ins(scores)[0]);
   return L->bq && L->bk && L->bv && L->bo && L->bf1 && L->bf2;
 }
 
@@ -892,6 +912,7 @@ bool ResolveDepthLayer(const Ctx& c, const OrtNode* sm, MatchedLayer* L, const O
   L->norm1 = norm1; L->norm2 = norm2; L->ls1 = ls1; L->ls2 = ls2;
   L->fused_qkv = true;
   L->qkv_blk_q = bq; L->qkv_blk_k = bk; L->qkv_blk_v = bv;
+  L->head_shape = HeadShapeOf(c, c.ins(scores)[0]);
   *res2_out = res2;
   return L->bq && L->bk && L->bv && L->bo && L->bf1 && L->bf2;
 }

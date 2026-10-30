@@ -3,17 +3,18 @@
 """Quantized-ONNX consumption test for the ort-rocket EP.
 
 Proves, on device, that the EP consumes an int8/int4 QDQ RF-DETR model: it recognizes the
-DequantizeLinear-wrapped weights, dequantizes them to fp16 at Compile (int8/int4/int32 biases,
-per-tensor and per-channel), and runs the backbone+projector on the NPU with detections faithful
-to a plain CPU-EP run of the SAME quantized model (the class set must match; boxes and scores
-within a quantization band). With ROCKET_ORT_INT8=1 it additionally exercises the native-int8 (W8A8)
+DequantizeLinear-wrapped weights, dequantizes them to fp16 when the session is created
+(int8/int4/int32 biases, per-tensor and per-channel), and runs the backbone+projector on the NPU
+with detections faithful to a plain CPU-EP run of the SAME quantized model (the class set must
+match; boxes and scores within a quantization band). With ROCKET_ORT_INT8=1 it additionally exercises the native-int8 (W8A8)
 datapath, which must stay faithful (slower is expected -- int8 matmul reads int32 back to the
 host; see rocket_backbone.h).
 
-ROCKET_ORT_STRICT=1 is set unless the caller chose, so an int8 marshaling miss fails Compile
-rather than falling back to fp16 and passing as the int8 datapath. A matcher miss runs the model
-on the CPU EP and matches the reference exactly, so the test also asserts the EP executed a node
-and that neither output is bit-identical to the CPU EP's. A CPU run with no detection fails.
+ROCKET_ORT_STRICT=1 is set unless the caller chose, so an int8 marshaling miss leaves the encoder
+on the CPU EP rather than falling back to fp16 and passing as the int8 datapath. That, like a
+matcher miss, runs the model on the CPU EP and matches the reference exactly, so the test also
+asserts the EP executed a node and that neither output is bit-identical to the CPU EP's. A CPU run
+with no detection fails.
 
 Where the model quantizes its activations (the static int8 QDQ export), the CPU EP runs them in
 int8 and the EP in fp16, so the two differ by more than the EP's own error: one near-duplicate
@@ -74,8 +75,8 @@ def main():
     print(f"[test] quantized model {os.path.basename(args.onnx)}  input {x.shape}  mode={mode}")
     if args.int8:
         os.environ["ROCKET_ORT_INT8"] = "1"
-    # Read at Compile. Without it a native-int8 marshaling miss falls back to fp16 and the run
-    # passes as the int8 datapath it never took.
+    # Read when the session is created. Without it a native-int8 marshaling miss falls back to fp16
+    # and the run passes as the int8 datapath it never took.
     os.environ.setdefault("ROCKET_ORT_STRICT", "1")
 
     # CPU-EP reference on the SAME quantized model.
