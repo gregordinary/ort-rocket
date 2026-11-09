@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ort-rocket authors
 //
 // rocket_match -- structural (op-topology) matcher for the RF-DETR DINOv2 encoder + CSP projector

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Shared checks for the ort-rocket EP tests: did the EP take the model, and did it compute?
 
 A matcher miss is not an error. The EP claims nothing, ONNX Runtime runs the whole model on its

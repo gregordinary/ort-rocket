@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ort-rocket authors
 //
 // rocket_backbone -- the NPU chain behind the ort-rocket EP. See rocket_backbone.h.

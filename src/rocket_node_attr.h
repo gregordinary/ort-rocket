@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ort-rocket authors
 //
 // rocket_node_attr: reading one ONNX node through ONNX Runtime's graph API, shared by the per-node

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ort-rocket authors
 //
 // rocket_convt: the ConvTranspose handler. Unlike the families, which claim one encoder subgraph by

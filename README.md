@@ -390,8 +390,8 @@ three frontends, a submit provider for the vendor kernel, and a set of optional 
 
 ## License and credits
 
-`ort-rocket` is GPL-3.0-or-later. It links the GPL-3 `rocket-userspace` driver library. It targets
-[ONNX Runtime](https://onnxruntime.ai) (MIT) as an out-of-tree plugin execution provider, and its
-plugin scaffolding follows ONNX Runtime's example plugin EP. The ONNX Runtime C and C++ API headers
+`ort-rocket` is MIT-licensed; see [LICENSE](LICENSE). It targets
+[ONNX Runtime](https://onnxruntime.ai) (MIT) as an out-of-tree plugin execution provider, and its plugin
+scaffolding follows ONNX Runtime's example plugin EP. The ONNX Runtime C and C++ API headers
 vendored under `third_party/onnxruntime/` are MIT-licensed (Copyright Microsoft Corporation).
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries ONNX Runtime's license notice.

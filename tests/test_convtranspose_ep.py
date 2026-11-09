@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """On-device faithfulness gate for the ort-rocket ConvTranspose handler.
 
 The handler claims ConvTranspose nodes one at a time and runs each on librocketnpu's resident

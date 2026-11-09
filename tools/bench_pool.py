@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The ort-rocket authors
 """Process-per-stream throughput: the ort-rocket EP pool vs the CPU-EP pool.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """On-device faithfulness gate for the ort-rocket Conv handler.
 
 The handler claims Conv nodes one at a time, each with the Relu or LeakyRelu that is its only

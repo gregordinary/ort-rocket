@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Quantized-ONNX consumption test for the ort-rocket EP.
 
 Proves, on device, that the EP consumes an int8/int4 QDQ RF-DETR model: it recognizes the

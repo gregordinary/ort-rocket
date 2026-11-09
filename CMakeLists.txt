@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.20)
 project(ort_rocket LANGUAGES C CXX)
 
