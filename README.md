@@ -39,15 +39,15 @@ environment variables.
 |---|---|---|---|
 | RF-DETR nano and base | The DINOv2 ViT-S backbone and the CSP feature projector, as one fused node | The deformable-attention decoder and the detection head | Supported |
 | CLIP and SigLIP image encoders, one family | The plain-ViT encoder | The pooling head | Supported |
-| SAM ViT-B (Segment Anything) | The ViT-Det image encoder, with its windowed and global attention and the conv neck | The prompt encoder and the mask decoder, apart from the decoder's two `ConvTranspose` upscalers | Supported |
+| SAM ViT-B (Segment Anything) image encoder | The ViT-Det encoder, with its windowed and global attention and the conv neck | None. The prompt encoder and the mask decoder are a separate model, whose two `ConvTranspose` upscalers are per-node claims | Supported |
 | Depth Anything v2 Small | The DINOv2 backbone, up to its four intermediate taps | The DPT head, apart from its per-node claims | Supported |
 | Depth Anything v2 Base | The same as Small | The same as Small | Supported |
-| ModernBERT text encoders, with an optional stack of pre-norm transformer layers after them | The encoder and those layers, over a batch of variable-length sequences | The model's task heads | Supported. Validated on the Laya decision model |
+| ModernBERT text encoders, with an optional stack of pre-norm transformer layers after them, validated on the Laya decision model | The encoder and those layers, over a batch of variable-length sequences | The model's task heads | Supported |
 | `ConvTranspose` nodes, in any model | A 2-D, `group` 1, fp32 node with a constant weight | Depthwise and grouped transposes | Supported (default) |
 | `Conv` nodes, in any model | A 2-D, `group` 1, fp32 node with a constant weight and a static input size, where the cost rule admits it | Depthwise and grouped convs, and a node the cost rule rejects | Supported (default) |
 | RF-DETR int8 and int4 QDQ models | The same encoder, with its weights dequantized to fp16 | | Supported (default) |
 | RF-DETR native int8 (W8A8) | The encoder's projection GEMMs, run as int8, ~1.8x slower than the fp16 path | | Supported (opt-in) |
-| QDQ models of the other families | | The whole model, apart from its per-node claims | Not supported. The EP declines the encoder with a warning |
+| QDQ models of the other families | | The whole model, apart from its per-node claims | Not supported |
 
 > [!CAUTION]
 > A family claim needs graph optimization off. Run the session at `ORT_DISABLE_ALL`. From
@@ -59,19 +59,29 @@ When the matcher recognizes a family, the EP marshals the encoder's weights, ope
 packs the resident weights before it claims the encoder. If any of these steps fails, the EP logs
 a warning and leaves the encoder on the CPU EP, and session creation goes on. The common causes are
 a process that cannot open the NPU and a part other than the RK3588. The EP also declines a QDQ
-model of any family but RF-DETR.
+model of any family but RF-DETR, and a vision model whose image input has a fixed batch above 1.
+
+> [!CAUTION]
+> A vision family's encoder runs one image per run. The EP declines a model whose image input
+> has a fixed batch above 1, so that model runs on the CPU EP. With a symbolic batch the EP
+> claims the encoder, and a run whose image input is not `[1, 3, H, W]` at the exported size
+> fails with `image input element count ... != expected`. Export a vision model at batch 1, and
+> run a batch as one run per image. ModernBERT takes a batch.
 
 > [!NOTE]
 > Set `session.intra_op.allow_spinning` to `0` in a session that uses the EP. With intra-op
 > spinning on, ONNX Runtime's idle threads occupy the cores that the EP's host work needs. A vision
-> model then runs up to 1.23x slower. The EP logs one warning when it claims work in a session that
-> spins.
+> model then takes up to 1.23x its time with spinning off. The EP logs one warning when it claims
+> work in a session that spins.
 
 The matcher recognizes a family by the structure of its encoder, not by tensor names, so a
 re-export that renames tensors still matches. RF-DETR is the exception. The EP reads its stem's
 cls token and position table, its feature norm and its projector by their exported names. It
-therefore declines a renamed RF-DETR export. A model outside the families runs on the CPU EP,
-apart from its per-node claims.
+therefore declines a renamed RF-DETR export, and it runs only nano's and base's geometries.
+
+Each family is validated on one export recipe, which [API.md](API.md#validated-exports) lists.
+Another exporter can produce a topology the matcher does not recognize. A model outside the
+families runs on the CPU EP, apart from its per-node claims.
 
 `GridSample` and a resize with `align_corners` both need a gather the RK3588 NPU does not have.
 RF-DETR's deformable-attention sampling and Depth Anything's DPT resizes therefore run on the CPU
@@ -100,14 +110,16 @@ rather than in attention, which the [`ntok/4d` ratio](#attention-shape-and-speed
 lowest speedup is SAM's, at near-parity.
 
 **Conditions:** RK3588 (a Turing RK1), NPU 928 MHz (the 900 MHz request), CPU governor
-`performance`, warm medians. Both runs use the four Cortex-A76 cores (`taskset -c 4-7`) and 4
-intra-op threads. The CPU EP runs at `ORT_ENABLE_ALL`, and the EP session at `ORT_DISABLE_ALL`
-with intra-op spinning off [HW sweep 2026-10-27].
+`performance`, warm medians, and the EP session's intra-op spinning off. A subsection's own
+Conditions line names what differs. In the single-stream vision rows, both runs use the four
+Cortex-A76 cores (`taskset -c 4-7`) and 4 intra-op threads. The CPU EP runs at `ORT_ENABLE_ALL`,
+and the EP session at `ORT_DISABLE_ALL` [HW sweep 2026-10-27].
 
-**Not characterized:** RF-DETR's COCO mAP and SAM's mask IoU on this build. They were measured on
-July 2026 builds. Depth Anything's speedups under the `Conv` cost rule's current estimate, which
-admits more of its head convs than the one they were measured under. On Small it runs the model in
-0.975-1.008x that one's time [HW sweep 2026-10-29].
+**Not characterized:** RF-DETR's COCO mAP and SAM's mask IoU on this build, which were measured on
+July 2026 builds. Depth Anything's speedups, and Base's agreement, under the `Conv` cost rule's
+current estimate. The current estimate claims 16 of Small's 30 head convs, where the one they were
+measured under claimed 10. On Small, the model runs in 0.975-1.008x the earlier estimate's time
+[HW sweep 2026-10-29].
 
 | Model | Encoder offloaded | Speedup over the CPU EP | Agreement with the CPU EP |
 |---|---|---:|---|
@@ -122,9 +134,10 @@ admits more of its head convs than the one they were measured under. On Small it
 | Laya typed decisions | ModernBERT-large, d=1024, 58-639 tokens | 2.68-5.36x | 3 of 3 answers agree, within 3.3e-4 |
 | Laya multilingual | mmBERT-base, d=768, 56-726 tokens | 1.50-3.57x | 6 of 6 answers agree, within 3.3e-4 |
 
-The Laya rows have their own conditions. The CPU EP runs at ONNX Runtime's default thread count,
-which ran this graph faster than 8 threads. The EP session runs with spinning on.
-[API.md](API.md#modernbert-text-encoders) has their conditions and the per-request figures.
+The Laya rows have their own conditions. Both sessions run at ONNX Runtime's default thread count
+with no core confinement, and the EP session runs with intra-op spinning on. The default thread
+count ran the CPU EP faster than 8 threads. Laya with spinning off is not characterized on this
+build. [API.md](API.md#modernbert-text-encoders) has the per-request figures.
 
 Reproduce a vision row with [`tools/bench_ep.py`](tools/bench_ep.py):
 
@@ -155,25 +168,25 @@ The ratio orders the global-attention encoders. Short-sequence wide encoders (CL
 most, then Depth Anything Base, then Small. The two Depth Anything variants run the same 1370
 tokens, and Base's d=768 halves the ratio and raises the speedup from 1.63-1.65x to 2.25-2.28x.
 
-The windowed encoders measure below a global encoder at a similar ratio: RF-DETR, at 0.17 and
-0.33, measures below Depth Anything Base at 0.45. RF-DETR base measures above nano, so the ratio
+A windowed encoder measures below a global encoder with a higher ratio: RF-DETR, at 0.17 and 0.33,
+measures below Depth Anything Base at 0.45. RF-DETR base measures above nano, so the ratio
 does not separate models whose speedups are that close. SAM measures lowest. Its four global layers
 each attend over 4096 tokens, at 16.8 million scores per head, the largest single attention in the
 set. These layers are the likely cause [hypothesis].
 
-The ratio holds the CPU EP's rate per MAC fixed, which is true across the vision models and not
-for the text model. The CPU EP runs the Laya graph, a d=1024 encoder with masked fp32 attention,
-at ~77 GOP/s. Laya therefore measures 5.35-5.36x at an `ntok/4d` of 0.16, where RF-DETR nano
-measures 1.70-1.73x. The low end of each Laya range is its shortest request, where the NPU's
-per-call dispatch dominates.
+The ratio holds the CPU EP's rate per MAC fixed, which is true across the vision models but not for
+the text model. The CPU EP runs the Laya graph, a d=1024 encoder with masked fp32 attention, at
+~77 GOP/s, against ~100 GOP/s on SigLIP-B/16 [host-computed]. Laya therefore measures 5.35-5.36x
+at an `ntok/4d` of 0.16, where RF-DETR nano measures 1.70-1.73x. The low end of each Laya range is
+its shortest request, where the NPU's per-call dispatch dominates [hypothesis].
 
 ### Per-node claims
 
 A `ConvTranspose` or `Conv` claim gains in proportion to that op's share of the model.
 
-**Conditions:** RK3588, NPU 928 MHz (the 900 MHz request), CPU governor `performance`, warm
-medians. Both runs use 4 intra-op threads on the four A76 cores and run at `ORT_ENABLE_ALL`. The
-EP session runs with intra-op spinning off [HW sweep 2026-10-27].
+**Conditions:** both runs use 4 intra-op threads on the four A76 cores, and both sessions run at
+`ORT_ENABLE_ALL`. The SAM rows ran with the NPU cores held on (`power/control=on`) [HW sweep
+2026-10-27].
 
 | Model | Claims | CPU EP | ort-rocket | Speedup | Agreement with the CPU EP |
 |---|---|---:|---:|---:|---|
@@ -183,19 +196,17 @@ EP session runs with intra-op spinning off [HW sweep 2026-10-27].
 | SAM ViT-B mask decoder, 64 points | `ConvTranspose` | 4625.5 ms | 4155.5 ms | 1.11x | Worst of 192 masks at IoU 0.9931 |
 
 On Depth Anything v2 Small, the cost rule claims 16 of the DPT head's 30 convs. The model then
-runs in 0.93-0.97x the time it takes with the `Conv` claim off [HW sweep 2026-10-29].
+runs in 0.931-0.948x the time it takes with the `Conv` claim off [HW sweep 2026-10-29].
 
 ### Multi-stream throughput
 
-A single stream leaves the NPU partly idle while the host runs the attention softmax and the nodes
-left on the CPU EP. Running one process per stream adds throughput: the NPU pool's best is ~1.5x the
-single-stream rate on RF-DETR nano and ~1.6x on SAM. The CPU EP gains little from the same layout.
-Against the CPU EP's own best pool, the NPU pool is 2.36-2.67x on RF-DETR nano and 1.72-1.75x on
-SAM. [API.md](API.md#multi-stream-throughput) has the per-model process layout.
+Running one process per stream adds throughput. The NPU pool's best is ~1.5x the single-stream
+rate on RF-DETR nano and ~1.6x on SAM. But the CPU EP gains little from the same layout. Against
+the CPU EP's own best pool, the NPU pool is 2.36-2.67x on RF-DETR nano and 1.72-1.75x on SAM.
+[API.md](API.md#multi-stream-throughput) has each model's process layout.
 
-**Conditions:** RK3588, NPU 928 MHz (the 900 MHz request), CPU governor `performance`, warm. Each EP
-process runs 4 intra-op threads with spinning off. The CPU EP's best pool is the best of 2x4, 4x2
-and 8x1 (processes x threads) [HW sweep 2026-10-27 and 2026-10-29].
+**Conditions:** each EP process runs 4 intra-op threads. The CPU EP's best pool is the best of
+2x4, 4x2 and 8x1 (processes x threads) [HW sweep 2026-10-27 and 2026-10-29].
 
 **Not characterized:** RF-DETR base, and SAM's CPU EP at 8 processes of 1 thread, which does not
 fit in 32 GB.
@@ -205,14 +216,15 @@ fit in 32 GB.
 | Part | Status |
 |---|---|
 | RK3588 | Supported. Every figure in this README was measured on one, a Turing RK1. |
-| RK3576 | Not supported. `librocketnpu`'s fp16 programs run on the RK3588 only. The EP reads the part from the device tree and claims nothing on another part, so the whole model runs on the CPU EP. |
+| RK3576 | Not supported. The encoders and convolutions the EP calls are RK3588 programs. The EP reads the part from the device tree and claims nothing on another part, so the whole model runs on the CPU EP. |
 
 ## Requirements
 
 - An RK3588 board on a mainline kernel with the `rocket` DRM-accel driver loaded, so that
   `/dev/accel/accel0` exists (`lsmod | grep rocket`).
-- ONNX Runtime 1.27, the release whose headers this repository vendors (API version 27). The EP
-  is validated on 1.27.0.
+- ONNX Runtime 1.27.0, the release whose headers this repository vendors (API version 27). The
+  same build also passes its SigLIP, RF-DETR and Depth Anything tests under 1.31.0 [HW sweep
+  2026-10-29]. Other releases are not characterized.
 - `rocket-userspace`, either installed as a `rocketnpu` CMake package or cloned next to this
   repository. Its own build needs libdrm, found through `pkg-config`, and the `rocket` uAPI header
   `drm/rocket_accel.h`.
@@ -227,11 +239,13 @@ The NPU boots at 200 MHz, and the EP computes correctly there. Above 200 MHz the
 clock follows the rail voltage, so a requested rate is not the rate the NPU runs at.
 
 Apply the `patches/rocket` clock and voltage patches, and load the module with
-`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs the NPU at 928 MHz.
+`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs the NPU at 928 MHz,
+the clock every timing in this README was measured at. The module reports the request it was
+loaded with:
 
-The timings in this README were measured with the 900 MHz request, at 928 MHz. The 600 MHz
-request runs at ~816 MHz on the same rail, and the 900 MHz request is 1.044x faster on matmul
-device time.
+```sh
+cat /sys/module/rocket/parameters/rocket_npu_clk_hz   # 900000000; 0 is the 200 MHz boot clock
+```
 
 > [!CAUTION]
 > With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request hard-locks
@@ -266,9 +280,9 @@ cmake --build build -j
 
 The EP calls ONNX Runtime only through the `OrtApi` and `OrtEpApi` function tables that ONNX
 Runtime passes to it. It therefore does not link `libonnxruntime`, and needs only the ONNX Runtime
-headers to build. The headers are vendored under `third_party/onnxruntime/include`. To build
-against another release's headers, pass `-DORT_HEADER_DIR=<path>`. The plugin-EP interface
-changes between ONNX Runtime releases, so build against the headers of the release you run.
+headers to build. The 1.27 headers are vendored under `third_party/onnxruntime/include`, and a
+build against them loads in 1.27.0 and 1.31.0. To build against another release's headers, pass
+`-DORT_HEADER_DIR=<path>`.
 
 ### Run from Python
 
@@ -316,13 +330,16 @@ again. The per-node claims also log, at INFO, the nodes they left on the CPU EP,
 `ort-rocket: not claiming the <family> encoder, which runs on ONNX Runtime's CPU kernels:
 <reason>` is logged at WARNING. The EP recognized the family and could not run it. The reason
 names the step that failed. Common ones are a process that cannot open `/dev/accel/accel0`
-(below), a QDQ model of a family other than RF-DETR, and a renamed RF-DETR export.
+(below), a QDQ model of a family other than RF-DETR, and a renamed RF-DETR export. A vision
+export at a fixed batch above 1 is declined too.
 
 ### Session creation failure
 
 A family claim declines instead of failing, as above. A per-node claim reads and packs its weight
-in `Compile`, so a failure there fails session creation, with an error that names the node. To
-leave those nodes on the CPU EP, set `ROCKET_ORT_CONV=0` or `ROCKET_ORT_CONVTRANSPOSE=0`.
+in `Compile`, so a failure there fails session creation, with an error that names the node. A
+`ConvTranspose` with a symbolic input size packs when a run first sees each size instead, and a
+failure there fails that run. To leave those nodes on the CPU EP, set `ROCKET_ORT_CONV=0` or
+`ROCKET_ORT_CONVTRANSPOSE=0`.
 
 ### `session.intra_op.allow_spinning` warning
 
@@ -335,14 +352,22 @@ so.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
 ### Slower than the figures above
 
-Check the NPU clock. At its 200 MHz boot rate the EP computes correctly, and runs slower than at
-the rates in [Clock](#clock). The figures above are warm medians, and a process's first run is
-slower than its later runs.
+The figures hold under the [Performance](#performance) Conditions. Check each one:
+
+- The NPU clock. `cat /sys/module/rocket/parameters/rocket_npu_clk_hz` prints the request the
+  module was loaded with. At `0`, the 200 MHz boot clock, the EP computes correctly and runs
+  slower. [Clock](#clock) gives the request.
+- The CPU governor. `cat /sys/devices/system/cpu/cpufreq/policy*/scaling_governor` prints it, and
+  the figures ran at `performance`. Under `ondemand`, pix2pix's speedup with both per-node claims
+  falls from 3.09x to 2.91x.
+- Intra-op spinning, which must be off, as in the warning entry above.
+- The cores. The vision figures confine both runs to the A76 cores with `taskset -c 4-7` at 4
+  intra-op threads.
+- Warm-up. A process's first run is slower than its later runs, and the figures are warm medians.
 
 ### `Permission denied` opening `/dev/accel/accel0`
 
-The node exists and this process cannot open it. Run with `sudo -E`, which keeps the `ROCKET_*`
-environment variables that plain `sudo` drops.
+The node exists and this process cannot open it. Run with `sudo -E`.
 
 ## The rocket NPU stack
 
@@ -361,12 +386,12 @@ three frontends, a submit provider for the vendor kernel, and a set of optional 
   `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree
   kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock above its 200 MHz
-  boot default. The timings here were measured with them, at 928 MHz (the 900 MHz request).
+  boot default.
 
 ## License and credits
 
-`ort-rocket` is GPL-3.0-or-later. It links the GPL-3 `rocket-userspace` driver library, whose NPU
-register headers are the GPL-3 reverse-engineering by Jasbir Matharu. It targets
-[ONNX Runtime](https://onnxruntime.ai) (MIT) as an out-of-tree plugin execution provider. The ONNX
-Runtime C and C++ API headers vendored under `third_party/onnxruntime/` are MIT-licensed
-(Copyright Microsoft Corporation).
+`ort-rocket` is GPL-3.0-or-later. It links the GPL-3 `rocket-userspace` driver library. It targets
+[ONNX Runtime](https://onnxruntime.ai) (MIT) as an out-of-tree plugin execution provider, and its
+plugin scaffolding follows ONNX Runtime's example plugin EP. The ONNX Runtime C and C++ API headers
+vendored under `third_party/onnxruntime/` are MIT-licensed (Copyright Microsoft Corporation).
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries ONNX Runtime's license notice.

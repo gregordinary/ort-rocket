@@ -340,19 +340,15 @@ def pix2pix(lib, tmp, path):
 
 
 def sam_image_pe(model_path):
-    """SAM's image-wide positional embedding [1,256,64,64], from the decoder's own
-    shared_image_embedding.positional_embedding [2,128] (the transformers SamModel formula)."""
+    """SAM's image-wide positional embedding [1,256,64,64]: the sine and cosine of
+    2*pi*(p @ G) at every pixel centre p = (x, y) in [-1, 1], where G is the decoder's own
+    shared_image_embedding.positional_embedding [2,128]."""
     m = onnx.load(model_path)
     g = next(numpy_helper.to_array(i) for i in m.graph.initializer
              if i.name == "shared_image_embedding.positional_embedding").astype(np.float64)
-    s = 64
-    grid = np.ones((s, s))
-    y = (np.cumsum(grid, 0) - 0.5) / s
-    x = (np.cumsum(grid, 1) - 0.5) / s
-    c = np.stack([x, y], -1) * 2 - 1
-    c = 2 * np.pi * (c @ g)
-    pe = np.concatenate([np.sin(c), np.cos(c)], -1)
-    return pe.transpose(2, 0, 1)[None].astype(np.float32)
+    t = (np.arange(64) + 0.5) / 32 - 1
+    a = 2 * np.pi * (np.stack(np.meshgrid(t, t), -1) @ g)
+    return np.concatenate([np.sin(a), np.cos(a)], -1).transpose(2, 0, 1)[None].astype(np.float32)
 
 
 def sam_feeds(emb, pe, npts):

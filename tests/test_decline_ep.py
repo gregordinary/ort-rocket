@@ -18,6 +18,8 @@ Cases this covers:
   ROCKET_CHIP=rk3576                any family: the part is not an RK3588
   ROCKET_ORT_RESIDENT=0             CLIP or Depth Anything: the one-shot encoder does not run them
   (no variable)                     a QDQ model of a family other than RF-DETR
+  (no variable)                     a vision model whose image input has a fixed batch above 1,
+                                    run with an input of that batch
 
 ROCKET_CHIP is read once per process, so run each case in its own process.
 """

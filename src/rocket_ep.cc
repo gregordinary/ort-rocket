@@ -2584,6 +2584,27 @@ static bool SiglipOneShotRuns(const rocket_siglip_model& sm) {
          sm.n_taps == 0;
 }
 
+// Every vision family's Compute reads one [1, 3, H, W] image and checks the element count on each
+// call, so a model whose image input has a concrete batch above 1 would be claimed and then fail every
+// run. Returns the reason to decline such a model, or "". A symbolic batch, a rank other than 4 or an
+// unreadable type cannot be checked before a run, and Compute's element count check still applies.
+static std::string ImageBatchWhy(const OrtApi& api, const OrtValueInfo* image) {
+  if (!image) return std::string();
+  const OrtTypeInfo* ti = nullptr;                       // graph-owned, not released
+  const OrtTensorTypeAndShapeInfo* tsi = nullptr;        // borrowed from ti, not released
+  size_t nd = 0;
+  if (OrtStatus* st = api.GetValueInfoTypeInfo(image, &ti)) { DiscardStatus(api, st); return std::string(); }
+  if (OrtStatus* st = api.CastTypeInfoToTensorInfo(ti, &tsi)) { DiscardStatus(api, st); return std::string(); }
+  if (!tsi) return std::string();
+  if (OrtStatus* st = api.GetDimensionsCount(tsi, &nd)) { DiscardStatus(api, st); return std::string(); }
+  if (nd != 4) return std::string();
+  std::vector<int64_t> dims(nd);
+  if (OrtStatus* st = api.GetDimensions(tsi, dims.data(), nd)) { DiscardStatus(api, st); return std::string(); }
+  if (dims[0] > 1)
+    return "the image input has a batch of " + std::to_string(dims[0]) + ", and the EP runs one image per run";
+  return std::string();
+}
+
 // Build the family claim's compiled state: check the claim's boundary, marshal the weights, open the
 // NPU and pack the resident context. GetCapability runs this on the full graph BEFORE it claims, so
 // every refusal a matched model can meet leaves its encoder on ONNX Runtime's CPU kernels with a
@@ -2619,6 +2640,10 @@ static std::string PrepareFamily(RocketEp* ep, const GraphMaps& m, const rocket_
   }
   if (b.qdq && fam != Family::DinoV2RfDetr)
     return "it is a QDQ model, and the EP reads QDQ weights for RF-DETR only";
+  if (fam != Family::ModernBert) {
+    why = ImageBatchWhy(api, b.input_infos[0]);
+    if (!why.empty()) return why;
+  }
 
   const bool mb_host = fam == Family::ModernBert && EnvOn("ROCKET_ORT_MB_HOST");
   if (!mb_host) {
