@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """On-device faithfulness gate for the ort-rocket CLIP (plain-ViT) offload.
 
 Runs the CLIP ViT-B/16 vision encoder twice in one process -- once on the ORT CPU EP, once with

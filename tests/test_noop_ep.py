@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """Plumbing test for an ort-rocket session that claims nothing.
 
 Proves, end to end, that:

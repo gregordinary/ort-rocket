@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """Capture the raw ort-rocket EP output tensors to .npy for a byte-identity diff.
 
 Used to prove a value-preserving refactor (e.g. a geometry generalization) leaves the

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """Gate: a model the EP recognizes and cannot run still creates its session, on the CPU EP.
 
 The EP builds a family claim's whole state in GetCapability, before it claims: the weights, the NPU

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """The EP's spinning warning: one line per session that claims work while intra-op threads spin.
 
 ONNX Runtime's spinning intra-op threads take the cores the EP's workers and host passes need, and

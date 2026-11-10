@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ort-rocket authors
 """Faithfulness gate for the ort-rocket ModernBERT offload, on the Laya decision model.
 
 Replays recorded Laya requests: each case .npz holds the exact session inputs Laya's own
